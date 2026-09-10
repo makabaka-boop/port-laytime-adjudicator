@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: demurrage
+      POSTGRES_PASSWORD: demurrage
+      POSTGRES_DB: demurrage
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demurrage -d demurrage"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://demurrage:demurrage@db:5432/demurrage
+    ports:
+      # 宿主端口由 API_PORT 覆盖，默认 8000；容器内固定监听 8000
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # 一次性验收服务：启动 API、等待健康检查通过后执行黑盒验收并退出。
+  # 运行： docker compose --profile verify run --rm verify
+  verify:
+    profiles: ["verify"]
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://api:8000
+    entrypoint: ["python", "-m", "scripts.verify", "http://api:8000"]
+    restart: "no"
+
+volumes:
+  pgdata:
