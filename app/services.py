@@ -1,6 +1,7 @@
-"""结算业务逻辑：计算、持久化、序列化。"""
+"""结算业务逻辑：计算、持久化、序列化、结果对比。"""
 
 import uuid
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -82,3 +83,70 @@ def create_calculation(db: Session, payload: DemurrageCreate) -> dict:
 def get_calculation(db: Session, result_id: str) -> dict | None:
     record = db.get(DemurrageRecord, result_id)
     return _to_out(record) if record is not None else None
+
+
+class ComparisonTargetMissing(LookupError):
+    """对比引用的结果标识不存在；``field`` 指明缺失的是基准还是候选。"""
+
+    def __init__(self, field: str, result_id: str) -> None:
+        self.field = field
+        self.result_id = result_id
+        label = "基准" if field == "base_id" else "候选"
+        super().__init__(f"找不到{label}结算结果（{field}）：{result_id}")
+
+
+def _sorted_pause_keys(pauses: list[dict]) -> list[tuple[datetime, datetime]]:
+    """把持久化的暂停列表规范化为按时间排序的键。
+
+    解析为时间值后排序比较，仅提交顺序或记法（Z / +00:00）不同
+    的相同区间不会产生虚假差异。
+    """
+    keys = [
+        (parse_utc_second(p["start"]), parse_utc_second(p["end"])) for p in pauses
+    ]
+    return sorted(keys)
+
+
+def compare_calculations(db: Session, base_id: str, candidate_id: str) -> dict:
+    """对比两条已持久化结果，只读不写库。
+
+    差异以序列化后的持久化值为准；暂停列表先按时间排序再比较。
+    增减值 = 候选 − 基准（有符号）。两个标识相同时自然得到空差异与全零增减。
+    """
+    base = db.get(DemurrageRecord, base_id)
+    if base is None:
+        raise ComparisonTargetMissing("base_id", base_id)
+    candidate = db.get(DemurrageRecord, candidate_id)
+    if candidate is None:
+        raise ComparisonTargetMissing("candidate_id", candidate_id)
+
+    base_out = _to_out(base)
+    candidate_out = _to_out(candidate)
+
+    changes = {
+        "work_start": base_out["work_start"] != candidate_out["work_start"],
+        "work_end": base_out["work_end"] != candidate_out["work_end"],
+        "pauses": _sorted_pause_keys(base_out["pauses"])
+        != _sorted_pause_keys(candidate_out["pauses"]),
+        "pauses_merged": _sorted_pause_keys(base_out["pauses_merged"])
+        != _sorted_pause_keys(candidate_out["pauses_merged"]),
+        "rate_cents_per_hour": base_out["rate_cents_per_hour"]
+        != candidate_out["rate_cents_per_hour"],
+        "allowed_seconds": base_out["allowed_seconds"]
+        != candidate_out["allowed_seconds"],
+    }
+    deltas = {
+        field: candidate_out[field] - base_out[field]
+        for field in (
+            "paused_seconds",
+            "billable_seconds",
+            "billable_hours",
+            "total_cents",
+        )
+    }
+    return {
+        "base_id": base_id,
+        "candidate_id": candidate_id,
+        "changes": changes,
+        "deltas": deltas,
+    }

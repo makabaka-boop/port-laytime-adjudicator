@@ -91,3 +91,35 @@ class DemurrageResult(BaseModel):
     billable_hours: int
     total_cents: int
     created_at: str
+
+
+class DemurrageCompareRequest(StrictModel):
+    base_id: str = Field(..., description="基准结果标识（差异与增减的参照方）")
+    candidate_id: str = Field(..., description="候选结果标识（与基准对比的一方）")
+
+
+class ComparisonChanges(BaseModel):
+    """逐项是否变化：作业起止、原始/合并暂停、费率、允许秒数。"""
+
+    work_start: bool
+    work_end: bool
+    pauses: bool
+    pauses_merged: bool
+    rate_cents_per_hour: bool
+    allowed_seconds: bool
+
+
+class ComparisonDeltas(BaseModel):
+    """候选相对基准的有符号增减值（候选 − 基准）。"""
+
+    paused_seconds: int
+    billable_seconds: int
+    billable_hours: int
+    total_cents: int
+
+
+class DemurrageComparison(BaseModel):
+    base_id: str
+    candidate_id: str
+    changes: ComparisonChanges
+    deltas: ComparisonDeltas

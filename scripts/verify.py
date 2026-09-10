@@ -6,7 +6,9 @@
   3. 非法请求返回 422 且错误可定位到具体路径，并且查不到任何结算结果；
   4. 成功结果可按 id 回查；零秒作业费用为零；
   5. 免计滞期允许秒数：小于净作业时长时仅对余额计费，等于或超过时费用为零，
-     暂停先合并再扣允许时长，实际扣减以净作业为上限；旧格式请求省略该字段按 0。
+     暂停先合并再扣允许时长，实际扣减以净作业为上限；旧格式请求省略该字段按 0；
+  6. 结果对比：费率/允许时长变化准确反映费用差额，暂停顺序不同不产生差异而
+     实际区间变化可见，缺失标识得到指向基准/候选的 404，相同标识对比为空差异。
 
 用法： python -m scripts.verify [BASE_URL]
 退出码 0 表示全部通过，否则为 1。
@@ -19,6 +21,7 @@ import urllib.request
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://api:8000"
 PATH = "/api/v1/demurrage/calculations"
+COMPARE_PATH = "/api/v1/demurrage/comparisons"
 
 
 def request(method: str, url: str, body: dict | None = None):
@@ -362,6 +365,133 @@ def case_allowed_seconds() -> None:
     assert_equal(result["total_cents"], 800, "旧总分值不变")
 
 
+def case_compare_results() -> None:
+    print("案例 6：结果对比——差额、暂停顺序不敏感、定向 404、相同结果空差异")
+    pauses = [
+        {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z"},
+        {"start": "2026-09-10T03:00:00Z", "end": "2026-09-10T04:00:00Z"},
+    ]
+    base_body = {
+        # 作业 8 小时，暂停共 2 小时 -> 净作业 6 小时，费用 600
+        "work_start": "2026-09-10T00:00:00Z",
+        "work_end": "2026-09-10T08:00:00Z",
+        "rate_cents_per_hour": 100,
+        "pauses": pauses,
+    }
+    status, base = request("POST", BASE_URL + PATH, base_body)
+    assert_equal(status, 201, "基准结果创建")
+
+    def compare(base_id: str, candidate_id: str):
+        return request(
+            "POST",
+            BASE_URL + COMPARE_PATH,
+            {"base_id": base_id, "candidate_id": candidate_id},
+        )
+
+    # 6.1 费率变化 100 -> 150：6 小时 × 50 分/小时 = +300 分
+    status, candidate = request(
+        "POST", BASE_URL + PATH, {**base_body, "rate_cents_per_hour": 150}
+    )
+    assert_equal(status, 201, "候选结果创建（费率变化）")
+    status, cmp = compare(base["id"], candidate["id"])
+    assert_equal(status, 200, "对比状态码")
+    assert_equal(cmp["base_id"], base["id"], "对比基准标识回显")
+    assert_equal(cmp["candidate_id"], candidate["id"], "对比候选标识回显")
+    assert_equal(cmp["changes"]["rate_cents_per_hour"], True, "费率变化已标明")
+    assert_equal(cmp["changes"]["pauses"], False, "暂停未变化")
+    assert_equal(cmp["changes"]["allowed_seconds"], False, "允许秒数未变化")
+    assert_equal(cmp["deltas"]["total_cents"], 300, "费率差额 +300 分")
+    assert_equal(cmp["deltas"]["billable_hours"], 0, "计费小时不变")
+
+    # 6.2 允许时长变化 0 -> 3600：可计费 6h -> 5h，费用 600 -> 500
+    status, candidate = request(
+        "POST", BASE_URL + PATH, {**base_body, "allowed_seconds": 3600}
+    )
+    assert_equal(status, 201, "候选结果创建（允许时长变化）")
+    status, cmp = compare(base["id"], candidate["id"])
+    assert_equal(status, 200, "对比状态码")
+    assert_equal(cmp["changes"]["allowed_seconds"], True, "允许秒数变化已标明")
+    assert_equal(cmp["deltas"]["billable_seconds"], -3600, "可计费秒数 -3600")
+    assert_equal(cmp["deltas"]["billable_hours"], -1, "计费小时 -1")
+    assert_equal(cmp["deltas"]["total_cents"], -100, "费用差额 -100 分")
+
+    # 6.3 同一组暂停仅提交顺序颠倒：不产生任何差异
+    status, candidate = request(
+        "POST", BASE_URL + PATH, {**base_body, "pauses": list(reversed(pauses))}
+    )
+    assert_equal(status, 201, "候选结果创建（暂停顺序颠倒）")
+    status, cmp = compare(base["id"], candidate["id"])
+    assert_equal(status, 200, "对比状态码")
+    assert_equal(
+        cmp["changes"],
+        {
+            "work_start": False,
+            "work_end": False,
+            "pauses": False,
+            "pauses_merged": False,
+            "rate_cents_per_hour": False,
+            "allowed_seconds": False,
+        },
+        "暂停顺序不同不产生虚假差异",
+    )
+    assert_equal(
+        cmp["deltas"],
+        {"paused_seconds": 0, "billable_seconds": 0,
+         "billable_hours": 0, "total_cents": 0},
+        "增减值全零",
+    )
+
+    # 6.4 实际区间变化可见：第二段暂停延长 1 小时
+    moved = [pauses[0], {"start": "2026-09-10T03:00:00Z",
+                         "end": "2026-09-10T05:00:00Z"}]
+    status, candidate = request(
+        "POST", BASE_URL + PATH, {**base_body, "pauses": moved}
+    )
+    assert_equal(status, 201, "候选结果创建（暂停区间变化）")
+    status, cmp = compare(base["id"], candidate["id"])
+    assert_equal(status, 200, "对比状态码")
+    assert_equal(cmp["changes"]["pauses"], True, "原始暂停变化已标明")
+    assert_equal(cmp["changes"]["pauses_merged"], True, "合并暂停变化已标明")
+    assert_equal(cmp["deltas"]["paused_seconds"], 3600, "暂停秒数 +3600")
+    assert_equal(cmp["deltas"]["billable_seconds"], -3600, "可计费秒数 -3600")
+    assert_equal(cmp["deltas"]["total_cents"], -100, "费用差额 -100 分")
+
+    # 6.5 缺失标识：404 能指出是基准还是候选
+    missing = "00000000-0000-0000-0000-000000000000"
+    status, err = compare(missing, base["id"])
+    assert_equal(status, 404, "基准缺失状态码")
+    if "base_id" not in err["detail"]:
+        raise AssertionError(f"基准缺失的 404 未指出 base_id：{err['detail']}")
+    print(f"  OK  基准缺失的 404 指向 base_id -> {err['detail']}")
+    status, err = compare(base["id"], missing)
+    assert_equal(status, 404, "候选缺失状态码")
+    if "candidate_id" not in err["detail"]:
+        raise AssertionError(f"候选缺失的 404 未指出 candidate_id：{err['detail']}")
+    print(f"  OK  候选缺失的 404 指向 candidate_id -> {err['detail']}")
+
+    # 6.6 相同标识对比：空差异、全零增减
+    status, cmp = compare(base["id"], base["id"])
+    assert_equal(status, 200, "相同标识对比状态码")
+    assert_equal(
+        cmp["changes"],
+        {
+            "work_start": False,
+            "work_end": False,
+            "pauses": False,
+            "pauses_merged": False,
+            "rate_cents_per_hour": False,
+            "allowed_seconds": False,
+        },
+        "相同标识：无变化",
+    )
+    assert_equal(
+        cmp["deltas"],
+        {"paused_seconds": 0, "billable_seconds": 0,
+         "billable_hours": 0, "total_cents": 0},
+        "相同标识：增减全零",
+    )
+
+
 def main() -> int:
     print(f"验收目标: {BASE_URL}")
     try:
@@ -370,6 +500,7 @@ def main() -> int:
         case_rounding_and_zero()
         case_allowed_seconds()
         case_invalid_requests_never_persist()
+        case_compare_results()
     except Exception as exc:
         print(f"\n验收失败: {exc}", file=sys.stderr)
         return 1

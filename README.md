@@ -33,7 +33,7 @@
 ```
 app/
   main.py          FastAPI 应用与 /health
-  routers.py       POST/GET 结算接口
+  routers.py       POST/GET 结算接口与结果对比接口
   schemas.py       Pydantic v2 请求/响应模型（字段级、可定位错误）
   services.py      计算编排、持久化、序列化
   intervals.py     裁剪 / 合并 / 取整 / 计费纯函数（规则核心）
@@ -87,6 +87,8 @@ docker compose --profile verify run --rm verify
 - **免计滞期允许秒数**：小于净作业时长时仅对余额计费；等于或超过净作业时长时
   费用为零且实际扣减以净作业为上限；暂停先合并、再扣允许时长（顺序不可颠倒）；
   省略该字段的旧格式请求按零处理，费用与历史一致。
+- **结果对比**：费率/允许时长变化准确反映费用差额；暂停仅顺序不同不产生差异，
+  实际区间变化如实可见；缺失标识的 404 指明基准或候选；相同标识对比为空差异。
 
 退出码为 0 即验收通过。
 
@@ -139,6 +141,50 @@ docker compose --profile verify run --rm verify
 ### 按结果标识回查 `GET /api/v1/demurrage/calculations/{id}`
 
 成功返回 `200`（结构同上）；不存在返回 `404`。
+
+### 对比两个既有结果 `POST /api/v1/demurrage/comparisons`
+
+复核费用争议时提交两个已持久化的结果标识，返回**从基准到候选**的结构化差异；
+只读取原记录，**不生成新的结算记录**。
+
+请求：
+
+```json
+{
+  "base_id": "…基准结果标识…",
+  "candidate_id": "…候选结果标识…"
+}
+```
+
+`200` 响应（`changes` 逐项标明是否变化，`deltas` 为候选 − 基准的有符号增减）：
+
+```json
+{
+  "base_id": "…",
+  "candidate_id": "…",
+  "changes": {
+    "work_start": false,
+    "work_end": false,
+    "pauses": false,
+    "pauses_merged": false,
+    "rate_cents_per_hour": true,
+    "allowed_seconds": false
+  },
+  "deltas": {
+    "paused_seconds": 0,
+    "billable_seconds": 0,
+    "billable_hours": 0,
+    "total_cents": 400
+  }
+}
+```
+
+- 对比以**已持久化值**为准，时间格式与单条查询一致；
+- 原始/合并暂停列表**先按时间排序再比较**，仅提交顺序不同不会报告差异，
+  实际区间变化则如实标明；
+- 两个标识相同时返回空差异（`changes` 全 `false`）与全零增减；
+- 任一标识不存在时返回 `404`，`detail` 指明缺失的是 `base_id` 还是
+  `candidate_id`；失败请求不写库。
 
 ### 错误格式（422，字段可定位）
 
