@@ -18,6 +18,8 @@ def _to_out(record: DemurrageRecord) -> dict:
         "pauses": record.pauses,
         "pauses_merged": record.pauses_merged,
         "rate_cents_per_hour": record.rate_cents_per_hour,
+        "allowed_seconds": record.allowed_seconds,
+        "allowed_seconds_used": record.allowed_seconds_used,
         "work_seconds": record.work_seconds,
         "paused_seconds": record.paused_seconds,
         "billable_seconds": record.billable_seconds,
@@ -39,6 +41,7 @@ def compute(payload: DemurrageCreate) -> Calculation:
         work_end=work_end,
         raw_pauses=raw_pauses,
         rate_cents_per_hour=payload.rate_cents_per_hour,
+        allowed_seconds=payload.allowed_seconds,
     )
 
 
@@ -50,12 +53,14 @@ def persist(db: Session, payload: DemurrageCreate, result: Calculation) -> dict:
         work_end=result.work_end,
         pauses=[{"start": p.start, "end": p.end} for p in payload.pauses],
         rate_cents_per_hour=result.rate_cents_per_hour,
+        allowed_seconds=result.allowed_seconds,
         pauses_merged=[
             {"start": format_utc_second(s), "end": format_utc_second(e)}
             for s, e in result.pauses_merged
         ],
         work_seconds=result.work_seconds,
         paused_seconds=result.paused_seconds,
+        allowed_seconds_used=result.allowed_seconds_used,
         billable_seconds=result.billable_seconds,
         billable_hours=result.billable_hours,
         total_cents=result.total_cents,

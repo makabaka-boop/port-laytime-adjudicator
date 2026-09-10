@@ -24,11 +24,17 @@ class DemurrageRecord(Base):
     # 形如 [{"start": "..", "end": ".."}]
     pauses: Mapped[list] = mapped_column(JSON, nullable=False)
     rate_cents_per_hour: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 租约约定的免计滞期允许秒数；历史记录由迁移回填为 0。
+    allowed_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # 计算结果
     pauses_merged: Mapped[list] = mapped_column(JSON, nullable=False)
     work_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     paused_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 实际扣减的允许秒数（以净作业秒数为上限，allowed_seconds 超出时小于约定值）
+    allowed_seconds_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     billable_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     billable_hours: Mapped[int] = mapped_column(Integer, nullable=False)
     total_cents: Mapped[int] = mapped_column(Integer, nullable=False)

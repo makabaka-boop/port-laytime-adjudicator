@@ -47,6 +47,13 @@ class DemurrageCreate(StrictModel):
     work_end: str = Field(..., description="作业结束（不含），必须晚于 work_start")
     rate_cents_per_hour: NonNegativeInt = Field(..., description="费率，非负整数，分/小时")
     pauses: list[PauseIn] = Field(default_factory=list, description="暂停区间，左闭右开")
+    allowed_seconds: NonNegativeInt = Field(
+        default=0,
+        description=(
+            "租约约定的免计滞期允许作业秒数，非负严格整数；"
+            "省略按 0 处理。先合并暂停得到净作业秒数，再扣减不超过净作业时长的部分。"
+        ),
+    )
 
     @field_validator("work_start")
     @classmethod
@@ -78,6 +85,8 @@ class DemurrageResult(BaseModel):
     rate_cents_per_hour: int
     work_seconds: int
     paused_seconds: int
+    allowed_seconds: int
+    allowed_seconds_used: int
     billable_seconds: int
     billable_hours: int
     total_cents: int

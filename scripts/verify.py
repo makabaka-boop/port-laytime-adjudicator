@@ -4,7 +4,9 @@
   1. 重复覆盖/首尾相接的停机只扣除一次，且合并结果可直接观察；
   2. 跨界停机只扣除与作业区间的交集；
   3. 非法请求返回 422 且错误可定位到具体路径，并且查不到任何结算结果；
-  4. 成功结果可按 id 回查；零秒作业费用为零。
+  4. 成功结果可按 id 回查；零秒作业费用为零；
+  5. 免计滞期允许秒数：小于净作业时长时仅对余额计费，等于或超过时费用为零，
+     暂停先合并再扣允许时长，实际扣减以净作业为上限；旧格式请求省略该字段按 0。
 
 用法： python -m scripts.verify [BASE_URL]
 退出码 0 表示全部通过，否则为 1。
@@ -221,6 +223,39 @@ def case_invalid_requests_never_persist() -> None:
             },
             "rate_cents_per_hour",
         ),
+        (
+            "负允许秒数",
+            {
+                "work_start": "2026-09-10T00:00:00Z",
+                "work_end": "2026-09-10T02:00:00Z",
+                "rate_cents_per_hour": 100,
+                "pauses": [],
+                "allowed_seconds": -1,
+            },
+            "allowed_seconds",
+        ),
+        (
+            "小数允许秒数（即使是整数值浮点）",
+            {
+                "work_start": "2026-09-10T00:00:00Z",
+                "work_end": "2026-09-10T02:00:00Z",
+                "rate_cents_per_hour": 100,
+                "pauses": [],
+                "allowed_seconds": 3600.0,
+            },
+            "allowed_seconds",
+        ),
+        (
+            "字符串允许秒数",
+            {
+                "work_start": "2026-09-10T00:00:00Z",
+                "work_end": "2026-09-10T02:00:00Z",
+                "rate_cents_per_hour": 100,
+                "pauses": [],
+                "allowed_seconds": "3600",
+            },
+            "allowed_seconds",
+        ),
     ]
 
     for label, body, loc_fragment in invalid_bodies:
@@ -241,12 +276,99 @@ def case_invalid_requests_never_persist() -> None:
     assert_equal(status, 404, "不存在的结果标识返回 404")
 
 
+def case_allowed_seconds() -> None:
+    print("案例 5：免计滞期允许秒数——先合并暂停，再扣不超过净作业的允许时长")
+    # 作业 4 小时（00:00-04:00），暂停 1 小时 -> 净作业 3 小时。
+
+    # 5.1 允许时长（1 小时）小于净作业时长：仅对余额 2 小时计费
+    body = {
+        "work_start": "2026-09-10T00:00:00Z",
+        "work_end": "2026-09-10T04:00:00Z",
+        "rate_cents_per_hour": 100,
+        "pauses": [
+            {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z"}
+        ],
+        "allowed_seconds": 3600,
+    }
+    status, result = request("POST", BASE_URL + PATH, body)
+    assert_equal(status, 201, "HTTP 状态码")
+    assert_equal(result["allowed_seconds"], 3600, "约定允许秒数原样回显")
+    assert_equal(result["allowed_seconds_used"], 3600, "实际扣减 3600")
+    assert_equal(result["paused_seconds"], 3600, "合并后暂停 1 小时")
+    assert_equal(result["billable_seconds"], 2 * 3600, "只对余额 2 小时计费")
+    assert_equal(result["billable_hours"], 2, "计费小时=2")
+    assert_equal(result["total_cents"], 200, "总分值=200")
+
+    status2, fetched = request("GET", f"{BASE_URL}{PATH}/{result['id']}")
+    assert_equal(status2, 200, "按 id 回查状态码")
+    assert_equal(fetched["allowed_seconds"], 3600, "回查约定允许秒数")
+    assert_equal(fetched["allowed_seconds_used"], 3600, "回查实际扣减")
+    assert_equal(fetched["total_cents"], 200, "回查总分值一致")
+
+    # 5.2 允许时长等于净作业时长（3 小时）：费用为零
+    body_equal = {**body, "allowed_seconds": 3 * 3600}
+    status, result = request("POST", BASE_URL + PATH, body_equal)
+    assert_equal(status, 201, "HTTP 状态码")
+    assert_equal(result["allowed_seconds_used"], 3 * 3600, "等于净作业：全额扣减")
+    assert_equal(result["billable_seconds"], 0, "余额 0 秒")
+    assert_equal(result["billable_hours"], 0, "0 小时")
+    assert_equal(result["total_cents"], 0, "费用为零")
+
+    # 5.3 允许时长超过净作业时长：约定值回显，实际扣减以净作业为上限
+    body_exceed = {**body, "allowed_seconds": 99 * 3600}
+    status, result = request("POST", BASE_URL + PATH, body_exceed)
+    assert_equal(status, 201, "HTTP 状态码")
+    assert_equal(result["allowed_seconds"], 99 * 3600, "约定值保持 99 小时")
+    assert_equal(result["allowed_seconds_used"], 3 * 3600, "实际扣减封顶为净作业")
+    assert_equal(result["billable_seconds"], 0, "余额不为负")
+    assert_equal(result["total_cents"], 0, "费用为零")
+
+    # 5.4 顺序不可颠倒：两段重叠暂停先合并为 2 小时，净作业仅 1 小时；
+    # 允许 2 小时实际只能扣 1 小时（以净作业为基准，而非含暂停的毛时长）。
+    body_order = {
+        "work_start": "2026-09-10T00:00:00Z",
+        "work_end": "2026-09-10T03:00:00Z",
+        "rate_cents_per_hour": 1000,
+        "pauses": [
+            {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:30:00Z"},
+            {"start": "2026-09-10T02:00:00Z", "end": "2026-09-10T03:00:00Z"},
+        ],
+        "allowed_seconds": 2 * 3600,
+    }
+    status, result = request("POST", BASE_URL + PATH, body_order)
+    assert_equal(status, 201, "HTTP 状态码")
+    assert_equal(
+        result["pauses_merged"],
+        [{"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T03:00:00Z"}],
+        "暂停先合并（01:00-03:00 一段）",
+    )
+    assert_equal(result["paused_seconds"], 2 * 3600, "合并后暂停 2 小时")
+    assert_equal(result["allowed_seconds_used"], 3600, "允许扣减以净作业 1 小时为上限")
+    assert_equal(result["billable_seconds"], 0, "余额 0 秒")
+    assert_equal(result["total_cents"], 0, "费用为零")
+
+    # 5.5 旧格式请求省略 allowed_seconds：按零处理，费用与历史一致
+    body_legacy = {
+        "work_start": "2026-09-10T00:00:00Z",
+        "work_end": "2026-09-10T08:00:00Z",
+        "rate_cents_per_hour": 100,
+        "pauses": [],
+    }
+    status, result = request("POST", BASE_URL + PATH, body_legacy)
+    assert_equal(status, 201, "HTTP 状态码")
+    assert_equal(result["allowed_seconds"], 0, "省略字段：约定值按 0")
+    assert_equal(result["allowed_seconds_used"], 0, "省略字段：实际扣减 0")
+    assert_equal(result["billable_seconds"], 8 * 3600, "旧费用结果不变")
+    assert_equal(result["total_cents"], 800, "旧总分值不变")
+
+
 def main() -> int:
     print(f"验收目标: {BASE_URL}")
     try:
         case_overlap_only_counted_once()
         case_cross_boundary_intersection_only()
         case_rounding_and_zero()
+        case_allowed_seconds()
         case_invalid_requests_never_persist()
     except Exception as exc:
         print(f"\n验收失败: {exc}", file=sys.stderr)

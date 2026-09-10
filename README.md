@@ -15,12 +15,18 @@
 3. 每个暂停区间同样为左闭右开，且结束必须严格晚于开始；
    **先裁剪到作业区间**（跨界暂停只取交集，作业外、仅端点相接的部分丢弃），
    再把**重叠或首尾相接**的区间合并；端点相等不会重复扣减、也不增加时长。
-4. 可计费秒数 = 作业秒数 − 合并后暂停秒数；计费小时按**不足一小时向上取整**
-   （零秒为零小时）。
-5. 总分 = 计费小时 × 费率（非负整数，分/小时）。零秒费用为零。
-6. 只有成功计算才会写库，持久化内容包括：**原始输入、合并区间、可计费秒数、
-   计费小时、总分值**等；时间倒置、空暂停（端点相等）、负费率等非法请求
-   **不会写入任何记录**。
+4. 净作业秒数 = 作业秒数 − 合并后暂停秒数；再扣除租约约定的**免计滞期允许秒数
+   `allowed_seconds`**，实际扣减 `allowed_seconds_used` 以净作业秒数为上限
+   （顺序不可颠倒：允许时长冲抵的是净作业时长，暂停不会被补回）；
+   可计费秒数 = 净作业秒数 − 实际扣减，计费小时按**不足一小时向上取整**
+   （零秒为零小时）。允许秒数为可选非负**严格整数**，省略按 0 处理，
+   此时规则与历史完全一致。
+5. 总分 = 计费小时 × 费率（非负整数，分/小时）。允许时长等于或超过净作业时长、
+   或可计费秒数为零时，费用为零。
+6. 只有成功计算才会写库，持久化内容包括：**原始输入、约定允许秒数与实际扣减、
+   合并区间、可计费秒数、计费小时、总分值**等；时间倒置、空暂停（端点相等）、
+   负费率、非法允许秒数等非法请求 **不会写入任何记录**。
+   既有记录由 Alembic 迁移 `0002` 回填零允许时长，迁移前后费用完全一致。
 
 ## 目录结构
 
@@ -34,7 +40,7 @@ app/
   timeparse.py     严格 RFC 3339 UTC 整秒解析
   models.py        SQLAlchemy ORM（demurrage_records）
   db.py config.py  引擎 / 会话 / 配置
-alembic/           数据库迁移（0001_initial）
+alembic/           数据库迁移（0001_initial，0002 回填零允许时长）
 scripts/
   entrypoint.sh    等待数据库 → alembic upgrade → uvicorn
   verify.py        一次性黑盒验收脚本（仅标准库）
@@ -77,7 +83,10 @@ docker compose --profile verify run --rm verify
 - **跨界停机仅扣交集**：跨作业起点/终点的暂停只保留作业内的 30 分钟、15 分钟，
   作业外与仅端点相接的暂停不出现；
 - **非法请求返回 422**，错误可定位到具体路径（如 `body/pauses/0/end`），
-  响应中没有结果标识，按任何 id 都查不到该结算结果。
+  响应中没有结果标识，按任何 id 都查不到该结算结果；
+- **免计滞期允许秒数**：小于净作业时长时仅对余额计费；等于或超过净作业时长时
+  费用为零且实际扣减以净作业为上限；暂停先合并、再扣允许时长（顺序不可颠倒）；
+  省略该字段的旧格式请求按零处理，费用与历史一致。
 
 退出码为 0 即验收通过。
 
@@ -85,7 +94,7 @@ docker compose --profile verify run --rm verify
 
 ### 创建结算 `POST /api/v1/demurrage/calculations`
 
-请求：
+请求（`allowed_seconds` 可选，省略按 0）：
 
 ```json
 {
@@ -95,7 +104,8 @@ docker compose --profile verify run --rm verify
   "pauses": [
     {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T03:00:00Z"},
     {"start": "2026-09-10T02:00:00Z", "end": "2026-09-10T05:00:00Z"}
-  ]
+  ],
+  "allowed_seconds": 3600
 }
 ```
 
@@ -113,12 +123,18 @@ docker compose --profile verify run --rm verify
   "rate_cents_per_hour": 100,
   "work_seconds": 28800,
   "paused_seconds": 14400,
-  "billable_seconds": 14400,
-  "billable_hours": 4,
-  "total_cents": 400,
+  "allowed_seconds": 3600,
+  "allowed_seconds_used": 3600,
+  "billable_seconds": 10800,
+  "billable_hours": 3,
+  "total_cents": 300,
   "created_at": "2026-09-10T…Z"
 }
 ```
+
+`allowed_seconds` 是租约约定值（原样回显），`allowed_seconds_used` 是实际
+扣减值（`min(allowed_seconds, 净作业秒数)`，约定值超过净作业时二者不同，
+此时费用为零）。创建与回查路径保持不变，两字段在两个响应中均完整序列化。
 
 ### 按结果标识回查 `GET /api/v1/demurrage/calculations/{id}`
 
@@ -139,9 +155,10 @@ FastAPI/Pydantic 标准结构，每条错误含 `loc`（字段路径）、`msg`�
 ```
 
 小数秒/非 UTC 偏移定位到 `body/<字段>`；暂停问题定位到
-`body/pauses/<下标>/start|end`；费率问题定位到 `body/rate_cents_per_hour`
-（严格整数，`1.5`、字符串、负数均拒绝）。多余字段（`extra="forbid"`）、
-缺字段同样 422。
+`body/pauses/<下标>/start|end`；费率与允许秒数问题分别定位到
+`body/rate_cents_per_hour`、`body/allowed_seconds`
+（均为严格非负整数，`1.5`、`3600.0`、字符串、布尔、负数均拒绝）。
+多余字段（`extra="forbid"`）、缺字段同样 422。非法请求不落任何记录。
 
 ## 本地开发与测试（无需 Docker / PostgreSQL）
 

@@ -3,6 +3,10 @@
 所有区间均为左闭右开 ``[start, end)``，端点必须是带 UTC 时区的 ``datetime``，
 且 ``end > start``。暂停区间先裁剪到作业区间，再把重叠或首尾相接的部分合并；
 端点相等（首尾相接）本身不产生重复扣减，也不额外增加时长。
+
+租约可约定免计滞期的允许作业时长：先裁剪、合并暂停得到净作业秒数，再从净作业
+秒数中扣除不超过它的允许秒数，剩余部分作为可计费秒数向上取整计费。扣除顺序
+不可颠倒——允许时长针对的是净作业时长，而非含暂停的毛时长。
 """
 
 from dataclasses import dataclass
@@ -74,6 +78,8 @@ class Calculation:
     pauses_merged: list[tuple[datetime, datetime]]
     work_seconds: int
     paused_seconds: int
+    allowed_seconds: int
+    allowed_seconds_used: int
     billable_seconds: int
     billable_hours: int
     rate_cents_per_hour: int
@@ -85,11 +91,23 @@ def calculate(
     work_end: datetime,
     raw_pauses: list[tuple[datetime, datetime]],
     rate_cents_per_hour: int,
+    allowed_seconds: int = 0,
 ) -> Calculation:
-    """执行完整结算计算。任何不合法输入都会抛出异常，调用方不得写库。"""
+    """执行完整结算计算。任何不合法输入都会抛出异常，调用方不得写库。
+
+    先裁剪、合并暂停并得到净作业秒数（work − paused），再扣除允许秒数；
+    允许扣减以净作业秒数为上限（``allowed_seconds_used`` 记录实际扣减值），
+    余额向上取整计费。
+    """
     validate_interval(work_start, work_end, "作业")
     if not isinstance(rate_cents_per_hour, int) or rate_cents_per_hour < 0:
         raise IntervalError("费率必须是非负整数（分/小时）")
+    if (
+        not isinstance(allowed_seconds, int)
+        or isinstance(allowed_seconds, bool)
+        or allowed_seconds < 0
+    ):
+        raise IntervalError("允许秒数必须是非负整数")
 
     clipped: list[tuple[datetime, datetime]] = []
     for pause_start, pause_end in raw_pauses:
@@ -100,10 +118,13 @@ def calculate(
     merged = merge_intervals(clipped)
     work_seconds = int((work_end - work_start).total_seconds())
     paused_seconds = total_seconds(merged)
-    billable_seconds = work_seconds - paused_seconds
-    if billable_seconds < 0:
+    net_seconds = work_seconds - paused_seconds
+    if net_seconds < 0:
         # 理论上裁剪/合并后不可能发生，保留作为防御性不变量。
-        raise IntervalError("可计费秒数不能为负")
+        raise IntervalError("净作业秒数不能为负")
+    # 先合并暂停、再扣允许时长：允许扣减以净作业秒数为上限，余额不可为负。
+    allowed_used = min(allowed_seconds, net_seconds)
+    billable_seconds = net_seconds - allowed_used
     hours = billable_hours(billable_seconds)
     total = hours * rate_cents_per_hour
 
@@ -113,6 +134,8 @@ def calculate(
         pauses_merged=merged,
         work_seconds=work_seconds,
         paused_seconds=paused_seconds,
+        allowed_seconds=allowed_seconds,
+        allowed_seconds_used=allowed_used,
         billable_seconds=billable_seconds,
         billable_hours=hours,
         rate_cents_per_hour=rate_cents_per_hour,
