@@ -8,17 +8,20 @@ from app.schemas import (
     DemurrageComparison,
     DemurrageCreate,
     DemurrageResult,
+    DemurrageTimeline,
     VoyageCapCreate,
     VoyageCapListResult,
 )
 from app.services import (
     ComparisonTargetMissing,
     DuplicateResultId,
+    TimelineInconsistency,
     VoyageCapTargetMissing,
     compare_calculations,
     create_calculation,
     create_voyage_cap_list,
     get_calculation,
+    get_calculation_timeline,
     get_voyage_cap_list,
 )
 
@@ -41,6 +44,29 @@ def read_calculation(
     result_id: str, db: Session = Depends(get_db)
 ) -> dict:
     result = get_calculation(db, result_id)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"找不到结算结果：{result_id}",
+        )
+    return result
+
+
+@router.get(
+    "/calculations/{result_id}/timeline",
+    response_model=DemurrageTimeline,
+)
+def read_calculation_timeline(
+    result_id: str, db: Session = Depends(get_db)
+) -> dict:
+    try:
+        result = get_calculation_timeline(db, result_id)
+    except TimelineInconsistency as exc:
+        # 持久化快照不自洽：可识别的 409 数据一致性错误，记录保持原样。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

@@ -12,7 +12,12 @@
   7. 航次封顶清单：合计未超上限逐项照录，超过时按比例分配且最大余数法补足整分、
      总额精确等于上限、同余数按提交顺序、零费用项分得零；重复标识得到定位下标的
      422，缺失引用得到指出下标与标识的 404，非法上限/数量不足返回 422 且不产生
-     清单，清单可按标识完整回放，不存在的清单返回 404。
+     清单，清单可按标识完整回放，不存在的清单返回 404；
+  8. 计费时间线：跨界/相接暂停按已合并快照形成首尾相接且覆盖整个作业区间的
+     连续分段，允许时长跨多个工作段消耗并在段内精确切分，耗尽后的工作段计费，
+     汇总回显与原结果一致；缺失标识得到带标识的 404。
+     （快照不一致的 409 数据一致性错误需直接改动持久化数据才能触发，
+     由 pytest 套件 tests/test_timeline.py 覆盖。）
 
 用法： python -m scripts.verify [BASE_URL]
 退出码 0 表示全部通过，否则为 1。
@@ -605,6 +610,100 @@ def case_voyage_cap_lists() -> None:
     print(f"  OK  不存在清单的 404 回显标识 -> {err['detail']}")
 
 
+def case_billing_timeline() -> None:
+    print("案例 8：计费时间线——连续分段、允许时长跨段消耗、汇总一致、定向 404")
+    # 作业 8 小时；两段相接的暂停输入（04:30-05:30、05:30-06:00）先合并为
+    # 04:30-06:00 一段。允许 9000 秒：第一个工作段（00:00-01:00）整段抵扣，
+    # 第二个工作段（02:00-04:30）前 5400 秒抵扣、余额计费，
+    # 允许时长耗尽后第三个工作段（06:00-08:00）整段计费。
+    body = {
+        "work_start": "2026-09-10T00:00:00Z",
+        "work_end": "2026-09-10T08:00:00Z",
+        "rate_cents_per_hour": 100,
+        "pauses": [
+            {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z"},
+            {"start": "2026-09-10T04:30:00Z", "end": "2026-09-10T05:30:00Z"},
+            # 与上一段首尾相接，合并后只形成一段暂停
+            {"start": "2026-09-10T05:30:00Z", "end": "2026-09-10T06:00:00Z"},
+        ],
+        "allowed_seconds": 9000,
+    }
+    status, result = request("POST", BASE_URL + PATH, body)
+    assert_equal(status, 201, "创建状态码")
+    assert_equal(
+        result["pauses_merged"],
+        [
+            {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z"},
+            {"start": "2026-09-10T04:30:00Z", "end": "2026-09-10T06:00:00Z"},
+        ],
+        "相接暂停合并为一段",
+    )
+    assert_equal(result["allowed_seconds_used"], 9000, "实际扣减 9000 秒")
+    assert_equal(result["billable_seconds"], 10800, "可计费 10800 秒")
+
+    status, timeline = request(
+        "GET", f"{BASE_URL}{PATH}/{result['id']}/timeline"
+    )
+    assert_equal(status, 200, "时间线状态码")
+    assert_equal(timeline["id"], result["id"], "时间线结果标识回显")
+    segments = timeline["segments"]
+
+    # 首尾相接且覆盖整个作业区间，无零长度段
+    assert_equal(segments[0]["start"], body["work_start"], "首段起点=作业起点")
+    assert_equal(segments[-1]["end"], body["work_end"], "末段终点=作业终点")
+    for previous, current in zip(segments, segments[1:]):
+        assert_equal(
+            current["start"], previous["end"],
+            f"分段相接 {previous['end']}",
+        )
+    for segment in segments:
+        if segment["seconds"] <= 0:
+            raise AssertionError(f"存在零长度分段：{segment}")
+    print("  OK  分段首尾相接、覆盖整个作业区间且无零长度段")
+
+    # 允许时长跨两个工作段消耗，并在第二段内精确切分
+    assert_equal(
+        [
+            (s["start"], s["end"], s["seconds"], s["category"])
+            for s in segments
+        ],
+        [
+            ("2026-09-10T00:00:00Z", "2026-09-10T01:00:00Z", 3600, "allowed"),
+            ("2026-09-10T01:00:00Z", "2026-09-10T02:00:00Z", 3600, "pause"),
+            ("2026-09-10T02:00:00Z", "2026-09-10T03:30:00Z", 5400, "allowed"),
+            ("2026-09-10T03:30:00Z", "2026-09-10T04:30:00Z", 3600, "billable"),
+            ("2026-09-10T04:30:00Z", "2026-09-10T06:00:00Z", 5400, "pause"),
+            ("2026-09-10T06:00:00Z", "2026-09-10T08:00:00Z", 7200, "billable"),
+        ],
+        "时间线分段（允许跨段消耗+段内切分+耗尽后计费）",
+    )
+
+    # 汇总回显与原结算结果逐项一致，且与分段合计吻合
+    totals = {"pause": 0, "allowed": 0, "billable": 0}
+    for segment in segments:
+        totals[segment["category"]] += segment["seconds"]
+    assert_equal(totals["pause"], result["paused_seconds"], "暂停分段合计")
+    assert_equal(
+        totals["allowed"], result["allowed_seconds_used"], "抵扣分段合计"
+    )
+    assert_equal(
+        totals["billable"], result["billable_seconds"], "计费分段合计"
+    )
+    for field in (
+        "paused_seconds", "allowed_seconds_used", "billable_seconds",
+        "billable_hours", "total_cents",
+    ):
+        assert_equal(timeline[field], result[field], f"汇总回显 {field}")
+
+    # 缺失标识：404 且回显标识
+    missing = "00000000-0000-0000-0000-000000000000"
+    status, err = request("GET", f"{BASE_URL}{PATH}/{missing}/timeline")
+    assert_equal(status, 404, "缺失标识的时间线状态码")
+    if missing not in err["detail"]:
+        raise AssertionError(f"缺失标识的 404 未回显标识：{err['detail']}")
+    print(f"  OK  缺失标识的 404 回显标识 -> {err['detail']}")
+
+
 def main() -> int:
     print(f"验收目标: {BASE_URL}")
     try:
@@ -615,6 +714,7 @@ def main() -> int:
         case_invalid_requests_never_persist()
         case_compare_results()
         case_voyage_cap_lists()
+        case_billing_timeline()
     except Exception as exc:
         print(f"\n验收失败: {exc}", file=sys.stderr)
         return 1

@@ -4,7 +4,7 @@
 """
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -96,6 +96,27 @@ class DemurrageResult(BaseModel):
 class DemurrageCompareRequest(StrictModel):
     base_id: str = Field(..., description="基准结果标识（差异与增减的参照方）")
     candidate_id: str = Field(..., description="候选结果标识（与基准对比的一方）")
+
+
+class TimelineSegmentOut(BaseModel):
+    """计费时间线分段：起止、秒数与类别（暂停/允许抵扣/计费）。"""
+
+    start: str
+    end: str
+    seconds: int
+    category: Literal["pause", "allowed", "billable"]
+
+
+class DemurrageTimeline(BaseModel):
+    """单笔结果的计费时间线：连续分段 + 与原记录一致的汇总回显。"""
+
+    id: str
+    segments: list[TimelineSegmentOut]
+    paused_seconds: int
+    allowed_seconds_used: int
+    billable_seconds: int
+    billable_hours: int
+    total_cents: int
 
 
 class ComparisonChanges(BaseModel):

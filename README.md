@@ -4,6 +4,8 @@
 计算可复核的滞期费并持久化，结算双方按结果标识回查即可得到完全一致的数字。
 同一航次在多个港口形成的既有结果，还可按提交顺序汇总为**不可变的航次封顶清单**
 （2–20 个结果 + 非负整数分赔付上限），超限时按比例与最大余数法分配。
+复核单笔费用时，还可按结果标识读取**计费时间线**：由持久化的作业边界与合并暂停
+扫描出首尾相接、覆盖整个作业区间的连续分段，逐段标明暂停、允许抵扣或计费。
 
 技术栈：**Python 3.12 · FastAPI · SQLAlchemy 2 · Alembic · PostgreSQL 16**，
 容器化使用 Docker Compose，测试使用 pytest。
@@ -35,10 +37,10 @@
 ```
 app/
   main.py          FastAPI 应用与 /health
-  routers.py       POST/GET 结算接口、结果对比接口与航次封顶清单接口
+  routers.py       POST/GET 结算接口、计费时间线、结果对比与航次封顶清单接口
   schemas.py       Pydantic v2 请求/响应模型（字段级、可定位错误）
-  services.py      计算编排、持久化、序列化、封顶分配（最大余数法）
-  intervals.py     裁剪 / 合并 / 取整 / 计费纯函数（规则核心）
+  services.py      计算编排、持久化、序列化、时间线生成、封顶分配（最大余数法）
+  intervals.py     裁剪 / 合并 / 取整 / 计费 / 时间线分段纯函数（规则核心）
   timeparse.py     严格 RFC 3339 UTC 整秒解析
   models.py        SQLAlchemy ORM（demurrage_records / voyage_cap_lists / voyage_cap_items）
   db.py config.py  引擎 / 会话 / 配置
@@ -46,7 +48,7 @@ alembic/           数据库迁移（0001_initial，0002 回填零允许时长�
 scripts/
   entrypoint.sh    等待数据库 → alembic upgrade → uvicorn
   verify.py        一次性黑盒验收脚本（仅标准库）
-tests/             pytest（时间解析 / 区间规则 / API / 迁移）
+tests/             pytest（时间解析 / 区间规则与时间线 / API / 迁移）
 docker-compose.yml Dockerfile requirements.txt
 ```
 
@@ -94,6 +96,9 @@ docker compose --profile verify run --rm verify
 - **航次封顶清单**：合计未超上限逐项照录；超限时按比例分配、最大余数法补足
   整分且总额精确等于上限；同余数按提交顺序分配；零费用项分得零；重复标识的
   422 定位到下标，缺失引用的 404 指出下标与标识；清单可按标识完整回放。
+- **计费时间线**：相接暂停按已合并快照只形成连续分段，分段首尾相接且覆盖
+  整个作业区间；允许时长跨多个工作段消耗并在段内精确切分，耗尽后的工作段
+  计费；汇总回显与原结果一致；缺失标识得到带标识的 404。
 
 退出码为 0 即验收通过。
 
@@ -146,6 +151,44 @@ docker compose --profile verify run --rm verify
 ### 按结果标识回查 `GET /api/v1/demurrage/calculations/{id}`
 
 成功返回 `200`（结构同上）；不存在返回 `404`。
+
+### 读取计费时间线 `GET /api/v1/demurrage/calculations/{id}/timeline`
+
+复核单笔费用时，按结果标识读取**计费时间线**：服务读取已持久化的作业边界与
+合并暂停，以边界扫描生成**首尾相接且覆盖整个作业区间**的连续分段——先标记
+暂停段，再按时间先后把实际抵扣秒数（`allowed_seconds_used`）消耗在非暂停
+区间（不足整段时在段内精确切分），剩余部分标记为计费。只读不写库。
+
+`200` 响应（每段含起止、秒数与类别；汇总回显原记录值）：
+
+```json
+{
+  "id": "…结果标识…",
+  "segments": [
+    {"start": "2026-09-10T00:00:00Z", "end": "2026-09-10T01:00:00Z",
+     "seconds": 3600, "category": "allowed"},
+    {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z",
+     "seconds": 3600, "category": "pause"},
+    {"start": "2026-09-10T02:00:00Z", "end": "2026-09-10T03:30:00Z",
+     "seconds": 5400, "category": "allowed"},
+    {"start": "2026-09-10T03:30:00Z", "end": "2026-09-10T04:30:00Z",
+     "seconds": 3600, "category": "billable"}
+  ],
+  "paused_seconds": 3600,
+  "allowed_seconds_used": 9000,
+  "billable_seconds": 3600,
+  "billable_hours": 1,
+  "total_cents": 100
+}
+```
+
+- `category` 取值：`pause`（暂停）、`allowed`（允许抵扣）、`billable`（计费）；
+  分段按时间升序、首尾相接、无零长度段，合计恰为整个作业区间；
+- 汇总字段（`paused_seconds` / `allowed_seconds_used` / `billable_seconds` /
+  `billable_hours` / `total_cents`）回显原记录，与分段合计一致；
+- 结果不存在：`404`，`detail` 回显标识；
+- 持久化快照无法形成连续时间线（如合并暂停互相重叠、越界，或分段合计与
+  记录不符）：`409` 数据一致性错误，`detail` 含标识与原因，**记录保持原样**。
 
 ### 对比两个既有结果 `POST /api/v1/demurrage/comparisons`
 

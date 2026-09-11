@@ -10,7 +10,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 class IntervalError(ValueError):
@@ -141,3 +141,84 @@ def calculate(
         rate_cents_per_hour=rate_cents_per_hour,
         total_cents=total,
     )
+
+
+# 时间线分段类别：暂停 / 允许抵扣 / 计费。
+CATEGORY_PAUSE = "pause"
+CATEGORY_ALLOWED = "allowed"
+CATEGORY_BILLABLE = "billable"
+
+
+@dataclass(frozen=True)
+class Segment:
+    """计费时间线分段：左闭右开区间加一个类别，时长恒为正。"""
+
+    start: datetime
+    end: datetime
+    category: str
+
+    @property
+    def seconds(self) -> int:
+        return int((self.end - self.start).total_seconds())
+
+
+def build_timeline(
+    work_start: datetime,
+    work_end: datetime,
+    pauses_merged: list[tuple[datetime, datetime]],
+    allowed_seconds_used: int,
+) -> list[Segment]:
+    """由作业边界与已合并暂停扫描出覆盖整个作业区间的连续分段（纯函数）。
+
+    以作业起止与全部暂停端点为切点做边界扫描，相邻切点成段，天然首尾
+    相接且无遗漏：先标记暂停段，再按时间先后把实际允许秒数消耗在非暂停
+    段上（不足整段时在段内精确切分），剩余部分标记为计费。
+
+    持久化快照不自洽（暂停倒置/越界/互相重叠、实际抵扣秒数无法被非暂停
+    区间耗尽等）时抛出 ``IntervalError``，调用方据此判定数据不一致。
+    """
+    validate_interval(work_start, work_end, "作业")
+    if (
+        not isinstance(allowed_seconds_used, int)
+        or isinstance(allowed_seconds_used, bool)
+        or allowed_seconds_used < 0
+    ):
+        raise IntervalError("实际抵扣秒数必须是非负整数")
+
+    pauses = sorted(pauses_merged, key=lambda item: (item[0], item[1]))
+    previous_end: datetime | None = None
+    for pause_start, pause_end in pauses:
+        validate_interval(pause_start, pause_end, "合并暂停")
+        if pause_start < work_start or pause_end > work_end:
+            raise IntervalError("合并暂停超出作业区间")
+        if previous_end is not None and pause_start < previous_end:
+            raise IntervalError("合并暂停互相重叠，不是已合并快照")
+        previous_end = pause_end
+
+    # 边界扫描：切点排序去重后相邻成段，必然首尾相接且覆盖整个作业区间。
+    boundaries = {work_start, work_end}
+    for pause_start, pause_end in pauses:
+        boundaries.add(pause_start)
+        boundaries.add(pause_end)
+    ordered = sorted(boundaries)
+
+    segments: list[Segment] = []
+    remaining = allowed_seconds_used
+    for left, right in zip(ordered, ordered[1:]):
+        if any(s <= left and right <= e for s, e in pauses):
+            segments.append(Segment(left, right, CATEGORY_PAUSE))
+            continue
+        span = int((right - left).total_seconds())
+        used = min(remaining, span)
+        remaining -= used
+        if used <= 0:
+            segments.append(Segment(left, right, CATEGORY_BILLABLE))
+            continue
+        split = left + timedelta(seconds=used)
+        segments.append(Segment(left, split, CATEGORY_ALLOWED))
+        if split < right:  # 段内精确切分：余额部分计费，不产生零长度段
+            segments.append(Segment(split, right, CATEGORY_BILLABLE))
+
+    if remaining > 0:
+        raise IntervalError("实际抵扣秒数超过非暂停时长，无法完整消耗")
+    return segments

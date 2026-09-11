@@ -5,6 +5,7 @@ import pytest
 from app.intervals import (
     IntervalError,
     billable_hours,
+    build_timeline,
     calculate,
     clip_to_work,
     merge_intervals,
@@ -220,3 +221,80 @@ def test_invalid_allowed_seconds_rejected():
     for bad in (-1, 1.5, "100", True, None):
         with pytest.raises(IntervalError):
             calculate(t(0), t(2), [], 100, allowed_seconds=bad)
+
+
+def _categories(segments):
+    return [(s.start, s.end, s.seconds, s.category) for s in segments]
+
+
+def test_timeline_boundary_scan_covers_whole_work_interval():
+    # 边界扫描：切点相邻成段，首尾相接覆盖整个作业区间；无允许时长时
+    # 非暂停段全部计费。
+    segments = build_timeline(
+        work_start=t(0), work_end=t(4),
+        pauses_merged=[(t(1), t(2))],
+        allowed_seconds_used=0,
+    )
+    assert _categories(segments) == [
+        (t(0), t(1), 3600, "billable"),
+        (t(1), t(2), 3600, "pause"),
+        (t(2), t(4), 7200, "billable"),
+    ]
+    # 首段起点=作业起点，末段终点=作业终点，相邻段首尾相接
+    assert segments[0].start == t(0)
+    assert segments[-1].end == t(4)
+    for previous, current in zip(segments, segments[1:]):
+        assert previous.end == current.start
+
+
+def test_timeline_allowed_spans_segments_and_splits_precisely():
+    # 允许 9000 秒：第一段 3600 整段抵扣，第二段（10800）前 5400 抵扣、
+    # 余额 5400 计费，耗尽后第三段整段计费；不产生零长度段。
+    segments = build_timeline(
+        work_start=t(0), work_end=t(8),
+        pauses_merged=[(t(1), t(2)), (t(5), t(6))],
+        allowed_seconds_used=9000,
+    )
+    assert _categories(segments) == [
+        (t(0), t(1), 3600, "allowed"),
+        (t(1), t(2), 3600, "pause"),
+        (t(2), t(3, 30), 5400, "allowed"),
+        (t(3, 30), t(5), 5400, "billable"),
+        (t(5), t(6), 3600, "pause"),
+        (t(6), t(8), 7200, "billable"),
+    ]
+    assert all(s.seconds > 0 for s in segments)
+
+
+def test_timeline_allowed_exactly_consumes_segment_without_zero_split():
+    # 允许时长恰好等于工作段长度：整段抵扣，不产生零长度计费段。
+    segments = build_timeline(
+        work_start=t(0), work_end=t(2),
+        pauses_merged=[(t(1), t(2))],
+        allowed_seconds_used=3600,
+    )
+    assert _categories(segments) == [
+        (t(0), t(1), 3600, "allowed"),
+        (t(1), t(2), 3600, "pause"),
+    ]
+
+
+def test_timeline_rejects_inconsistent_snapshot():
+    work = (t(0), t(4))
+    # 合并暂停互相重叠
+    with pytest.raises(IntervalError):
+        build_timeline(*work, [(t(1), t(3)), (t(2), t(4))], 0)
+    # 合并暂停超出作业边界
+    with pytest.raises(IntervalError):
+        build_timeline(*work, [(t(3), t(5))], 0)
+    # 合并暂停倒置
+    with pytest.raises(IntervalError):
+        build_timeline(*work, [(t(2), t(1))], 0)
+    # 实际抵扣秒数超过非暂停时长，无法完整消耗
+    with pytest.raises(IntervalError):
+        build_timeline(*work, [(t(0), t(2))], 3 * 3600)
+    # 作业区间倒置 / 非法抵扣值
+    with pytest.raises(IntervalError):
+        build_timeline(t(4), t(0), [], 0)
+    with pytest.raises(IntervalError):
+        build_timeline(*work, [], -1)

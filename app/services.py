@@ -1,11 +1,16 @@
-"""结算业务逻辑：计算、持久化、序列化、结果对比、航次封顶清单。"""
+"""结算业务逻辑：计算、持久化、序列化、结果对比、航次封顶清单、计费时间线。"""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.intervals import Calculation, IntervalError, calculate as run_calculate
+from app.intervals import (
+    Calculation,
+    IntervalError,
+    build_timeline,
+    calculate as run_calculate,
+)
 from app.models import DemurrageRecord, VoyageCapItem, VoyageCapList
 from app.schemas import DemurrageCreate, VoyageCapCreate
 from app.timeparse import format_utc_second, parse_utc_second
@@ -83,6 +88,83 @@ def create_calculation(db: Session, payload: DemurrageCreate) -> dict:
 def get_calculation(db: Session, result_id: str) -> dict | None:
     record = db.get(DemurrageRecord, result_id)
     return _to_out(record) if record is not None else None
+
+
+class TimelineInconsistency(RuntimeError):
+    """持久化快照无法形成连续计费时间线（409 语义）；记录保持原样。"""
+
+    def __init__(self, result_id: str, reason: str) -> None:
+        self.result_id = result_id
+        super().__init__(
+            f"结算结果 {result_id} 的快照无法形成连续计费时间线：{reason}"
+        )
+
+
+def _as_utc(value: datetime) -> datetime:
+    """把持久化时间规范化为带 UTC 时区的值（SQLite 读出时可能不带时区）。"""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def get_calculation_timeline(db: Session, result_id: str) -> dict | None:
+    """按结果标识读取计费时间线；只读不写库。
+
+    分段由持久化的作业边界与合并暂停扫描生成：先标记暂停，再按时间先后
+    把实际抵扣秒数消耗在非暂停区间，剩余部分计费。汇总字段回显原记录值，
+    且必须与分段合计一致，否则抛出 ``TimelineInconsistency``（409）。
+    """
+    record = db.get(DemurrageRecord, result_id)
+    if record is None:
+        return None
+
+    try:
+        pauses_merged = [
+            (parse_utc_second(p["start"]), parse_utc_second(p["end"]))
+            for p in record.pauses_merged
+        ]
+        segments = build_timeline(
+            work_start=_as_utc(record.work_start),
+            work_end=_as_utc(record.work_end),
+            pauses_merged=pauses_merged,
+            allowed_seconds_used=record.allowed_seconds_used,
+        )
+    except (IntervalError, ValueError, KeyError, TypeError) as exc:
+        raise TimelineInconsistency(result_id, str(exc)) from exc
+
+    totals = {"pause": 0, "allowed": 0, "billable": 0}
+    for segment in segments:
+        totals[segment.category] += segment.seconds
+    persisted = {
+        "pause": record.paused_seconds,
+        "allowed": record.allowed_seconds_used,
+        "billable": record.billable_seconds,
+    }
+    for category, expected in persisted.items():
+        if totals[category] != expected:
+            raise TimelineInconsistency(
+                result_id,
+                f"{category} 分段合计 {totals[category]} 秒"
+                f"与记录的 {expected} 秒不符",
+            )
+
+    return {
+        "id": record.id,
+        "segments": [
+            {
+                "start": format_utc_second(segment.start),
+                "end": format_utc_second(segment.end),
+                "seconds": segment.seconds,
+                "category": segment.category,
+            }
+            for segment in segments
+        ],
+        "paused_seconds": record.paused_seconds,
+        "allowed_seconds_used": record.allowed_seconds_used,
+        "billable_seconds": record.billable_seconds,
+        "billable_hours": record.billable_hours,
+        "total_cents": record.total_cents,
+    }
 
 
 class ComparisonTargetMissing(LookupError):
