@@ -8,7 +8,11 @@
   5. 免计滞期允许秒数：小于净作业时长时仅对余额计费，等于或超过时费用为零，
      暂停先合并再扣允许时长，实际扣减以净作业为上限；旧格式请求省略该字段按 0；
   6. 结果对比：费率/允许时长变化准确反映费用差额，暂停顺序不同不产生差异而
-     实际区间变化可见，缺失标识得到指向基准/候选的 404，相同标识对比为空差异。
+     实际区间变化可见，缺失标识得到指向基准/候选的 404，相同标识对比为空差异；
+  7. 航次封顶清单：合计未超上限逐项照录，超过时按比例分配且最大余数法补足整分、
+     总额精确等于上限、同余数按提交顺序、零费用项分得零；重复标识得到定位下标的
+     422，缺失引用得到指出下标与标识的 404，非法上限/数量不足返回 422 且不产生
+     清单，清单可按标识完整回放，不存在的清单返回 404。
 
 用法： python -m scripts.verify [BASE_URL]
 退出码 0 表示全部通过，否则为 1。
@@ -22,6 +26,7 @@ import urllib.request
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://api:8000"
 PATH = "/api/v1/demurrage/calculations"
 COMPARE_PATH = "/api/v1/demurrage/comparisons"
+CAPS_PATH = "/api/v1/demurrage/voyage-caps"
 
 
 def request(method: str, url: str, body: dict | None = None):
@@ -492,6 +497,114 @@ def case_compare_results() -> None:
     )
 
 
+def case_voyage_cap_lists() -> None:
+    print("案例 7：航次封顶清单——照录 / 比例分配 / 最大余数 / 失败不留痕")
+
+    def make_result(fee_cents: int) -> str:
+        """创建一条 1 小时作业的结算结果，费用恰为 fee_cents 分。"""
+        status, result = request(
+            "POST",
+            BASE_URL + PATH,
+            {
+                "work_start": "2026-09-10T00:00:00Z",
+                "work_end": "2026-09-10T01:00:00Z",
+                "rate_cents_per_hour": fee_cents,
+                "pauses": [],
+            },
+        )
+        assert_equal(status, 201, "准备结算结果状态码")
+        assert_equal(result["total_cents"], fee_cents, "准备结果费用")
+        return result["id"]
+
+    def create_cap_list(result_ids: list[str], cap_cents):
+        return request(
+            "POST",
+            BASE_URL + CAPS_PATH,
+            {"result_ids": result_ids, "cap_cents": cap_cents},
+        )
+
+    # 7.1 合计未超上限：逐项照录，清单可按标识完整回放
+    ids = [make_result(100), make_result(200), make_result(300)]
+    status, cap_list = create_cap_list(ids, 600)
+    assert_equal(status, 201, "未触发封顶状态码")
+    assert_equal(cap_list["capped"], False, "未触发封顶标记")
+    assert_equal(cap_list["original_total_cents"], 600, "原费用合计")
+    assert_equal(cap_list["allocated_total_cents"], 600, "分配合计=原合计")
+    assert_equal(
+        [item["position"] for item in cap_list["items"]], [0, 1, 2], "明细按提交顺序"
+    )
+    assert_equal(
+        [item["result_id"] for item in cap_list["items"]], ids, "明细结果标识"
+    )
+    assert_equal(
+        [item["allocated_cents"] for item in cap_list["items"]],
+        [100, 200, 300],
+        "未触发封顶逐项照录",
+    )
+    status, fetched = request("GET", f"{BASE_URL}{CAPS_PATH}/{cap_list['id']}")
+    assert_equal(status, 200, "清单回查状态码")
+    assert_equal(fetched, cap_list, "清单回放缓存一致（不可变快照）")
+
+    # 7.2 触发封顶：同余数按提交顺序分配，总额精确等于上限
+    ids = [make_result(100), make_result(100), make_result(100)]
+    status, cap_list = create_cap_list(ids, 100)
+    assert_equal(status, 201, "触发封顶状态码")
+    assert_equal(cap_list["capped"], True, "触发封顶标记")
+    assert_equal(
+        [item["allocated_cents"] for item in cap_list["items"]],
+        [34, 33, 33],
+        "同余数按提交顺序分配",
+    )
+    assert_equal(cap_list["allocated_total_cents"], 100, "分配总额精确等于上限")
+
+    # 7.3 零费用项始终分得零
+    ids = [make_result(0), make_result(3), make_result(3), make_result(3)]
+    status, cap_list = create_cap_list(ids, 4)
+    assert_equal(status, 201, "零费用项状态码")
+    assert_equal(
+        [item["allocated_cents"] for item in cap_list["items"]],
+        [0, 2, 1, 1],
+        "零费用项分得零，正费用项按最大余数分配",
+    )
+    assert_equal(cap_list["allocated_total_cents"], 4, "分配总额精确等于上限")
+
+    # 7.4 重复结果标识：422 定位到重复出现的下标，且不产生清单
+    a, b = make_result(100), make_result(200)
+    status, err = create_cap_list([a, b, a], 10)
+    assert_equal(status, 422, "重复标识状态码")
+    if "id" in err:
+        raise AssertionError("重复标识不应返回清单标识")
+    assert_loc_contains(err["detail"], "result_ids/2", "重复标识定位下标")
+
+    # 7.5 缺失引用：404 指出下标与标识
+    missing = "00000000-0000-0000-0000-000000000000"
+    status, err = create_cap_list([a, missing], 10)
+    assert_equal(status, 404, "缺失引用状态码")
+    if "result_ids[1]" not in err["detail"] or missing not in err["detail"]:
+        raise AssertionError(
+            f"缺失引用的 404 未指出下标与标识：{err['detail']}"
+        )
+    print(f"  OK  缺失引用的 404 指出下标与标识 -> {err['detail']}")
+
+    # 7.6 非法上限与数量不足：422 且不产生清单
+    for label, body in (
+        ("负上限", {"result_ids": [a, b], "cap_cents": -1}),
+        ("小数上限", {"result_ids": [a, b], "cap_cents": 1.5}),
+        ("不足两个结果", {"result_ids": [a], "cap_cents": 10}),
+    ):
+        status, err = request("POST", BASE_URL + CAPS_PATH, body)
+        assert_equal(status, 422, f"[{label}] 状态码")
+        if "id" in err:
+            raise AssertionError(f"[{label}] 不应返回清单标识")
+
+    # 7.7 查询不存在的清单返回 404
+    status, err = request("GET", f"{BASE_URL}{CAPS_PATH}/{missing}")
+    assert_equal(status, 404, "不存在清单状态码")
+    if missing not in err["detail"]:
+        raise AssertionError(f"不存在清单的 404 未回显标识：{err['detail']}")
+    print(f"  OK  不存在清单的 404 回显标识 -> {err['detail']}")
+
+
 def main() -> int:
     print(f"验收目标: {BASE_URL}")
     try:
@@ -501,6 +614,7 @@ def main() -> int:
         case_allowed_seconds()
         case_invalid_requests_never_persist()
         case_compare_results()
+        case_voyage_cap_lists()
     except Exception as exc:
         print(f"\n验收失败: {exc}", file=sys.stderr)
         return 1

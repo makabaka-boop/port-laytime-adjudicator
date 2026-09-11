@@ -1,4 +1,4 @@
-"""结算业务逻辑：计算、持久化、序列化、结果对比。"""
+"""结算业务逻辑：计算、持久化、序列化、结果对比、航次封顶清单。"""
 
 import uuid
 from datetime import datetime
@@ -6,8 +6,8 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.intervals import Calculation, IntervalError, calculate as run_calculate
-from app.models import DemurrageRecord
-from app.schemas import DemurrageCreate
+from app.models import DemurrageRecord, VoyageCapItem, VoyageCapList
+from app.schemas import DemurrageCreate, VoyageCapCreate
 from app.timeparse import format_utc_second, parse_utc_second
 
 
@@ -150,3 +150,124 @@ def compare_calculations(db: Session, base_id: str, candidate_id: str) -> dict:
         "changes": changes,
         "deltas": deltas,
     }
+
+
+class DuplicateResultId(ValueError):
+    """清单引用的结果标识重复；``index`` 是重复出现的下标（第二次及以后）。"""
+
+    def __init__(self, index: int, result_id: str) -> None:
+        self.index = index
+        self.result_id = result_id
+        super().__init__(
+            f"结果标识重复（result_ids[{index}]）：{result_id}"
+        )
+
+
+class VoyageCapTargetMissing(LookupError):
+    """清单引用的结果标识不存在；``index`` 指明缺失引用所在的下标。"""
+
+    def __init__(self, index: int, result_id: str) -> None:
+        self.index = index
+        self.result_id = result_id
+        super().__init__(
+            f"找不到下标 {index} 引用的结算结果（result_ids[{index}]）：{result_id}"
+        )
+
+
+def allocate_cap(originals: list[int], cap: int) -> list[int]:
+    """按原费用比例把上限分配到各项（纯函数）。
+
+    原费用合计未超过上限时逐项照录；超过时各项先取 ``cap * 原费用 / 合计``
+    的整数部分，剩余整分按最大余数法逐项补足，余数相同按下标（提交顺序）
+    小者优先；零费用项始终分得零。保证返回合计恰好等于
+    ``min(sum(originals), cap)``。
+    """
+    total = sum(originals)
+    if total <= cap:
+        return list(originals)
+
+    allocated = [0] * len(originals)
+    quotas: list[tuple[int, int]] = []  # (余数, 下标)，仅正费用项参与
+    for index, fee in enumerate(originals):
+        if fee <= 0:
+            continue  # 零费用项始终分得零
+        numerator = cap * fee
+        allocated[index] = numerator // total
+        quotas.append((numerator % total, index))
+
+    leftover = cap - sum(allocated)
+    # 最大余数法：余数大者优先；余数相同按提交顺序（下标小者优先）。
+    quotas.sort(key=lambda quota: (-quota[0], quota[1]))
+    for _, index in quotas[:leftover]:
+        allocated[index] += 1
+    return allocated
+
+
+def _voyage_cap_to_out(cap_list: VoyageCapList) -> dict:
+    items = sorted(cap_list.items, key=lambda item: item.position)
+    return {
+        "id": cap_list.id,
+        "cap_cents": cap_list.cap_cents,
+        "original_total_cents": cap_list.original_total_cents,
+        "allocated_total_cents": cap_list.allocated_total_cents,
+        "capped": cap_list.original_total_cents > cap_list.cap_cents,
+        "items": [
+            {
+                "position": item.position,
+                "result_id": item.result_id,
+                "original_cents": item.original_cents,
+                "allocated_cents": item.allocated_cents,
+            }
+            for item in items
+        ],
+        "created_at": format_utc_second(cap_list.created_at),
+    }
+
+
+def create_voyage_cap_list(db: Session, payload: VoyageCapCreate) -> dict:
+    """生成不可变航次封顶清单并落库。
+
+    重复标识（422 语义）与缺失引用（404 语义）在任何写入之前抛出，
+    失败请求不会留下清单或明细。
+    """
+    seen: dict[str, int] = {}
+    for index, result_id in enumerate(payload.result_ids):
+        if result_id in seen:
+            raise DuplicateResultId(index, result_id)
+        seen[result_id] = index
+
+    records: list[DemurrageRecord] = []
+    for index, result_id in enumerate(payload.result_ids):
+        record = db.get(DemurrageRecord, result_id)
+        if record is None:
+            raise VoyageCapTargetMissing(index, result_id)
+        records.append(record)
+
+    originals = [record.total_cents for record in records]
+    allocated = allocate_cap(originals, payload.cap_cents)
+
+    cap_list = VoyageCapList(
+        id=str(uuid.uuid4()),
+        cap_cents=payload.cap_cents,
+        original_total_cents=sum(originals),
+        allocated_total_cents=sum(allocated),
+        item_count=len(originals),
+        items=[
+            VoyageCapItem(
+                position=index,
+                result_id=record.id,
+                original_cents=originals[index],
+                allocated_cents=allocated[index],
+            )
+            for index, record in enumerate(records)
+        ],
+    )
+    db.add(cap_list)
+    db.commit()
+    db.refresh(cap_list)
+    return _voyage_cap_to_out(cap_list)
+
+
+def get_voyage_cap_list(db: Session, list_id: str) -> dict | None:
+    cap_list = db.get(VoyageCapList, list_id)
+    return _voyage_cap_to_out(cap_list) if cap_list is not None else None

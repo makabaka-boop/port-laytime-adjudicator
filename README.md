@@ -2,6 +2,8 @@
 
 纯后端服务：给定散货船作业区间、停机（暂停）区间与费率，由**同一套边界规则**
 计算可复核的滞期费并持久化，结算双方按结果标识回查即可得到完全一致的数字。
+同一航次在多个港口形成的既有结果，还可按提交顺序汇总为**不可变的航次封顶清单**
+（2–20 个结果 + 非负整数分赔付上限），超限时按比例与最大余数法分配。
 
 技术栈：**Python 3.12 · FastAPI · SQLAlchemy 2 · Alembic · PostgreSQL 16**，
 容器化使用 Docker Compose，测试使用 pytest。
@@ -33,14 +35,14 @@
 ```
 app/
   main.py          FastAPI 应用与 /health
-  routers.py       POST/GET 结算接口与结果对比接口
+  routers.py       POST/GET 结算接口、结果对比接口与航次封顶清单接口
   schemas.py       Pydantic v2 请求/响应模型（字段级、可定位错误）
-  services.py      计算编排、持久化、序列化
+  services.py      计算编排、持久化、序列化、封顶分配（最大余数法）
   intervals.py     裁剪 / 合并 / 取整 / 计费纯函数（规则核心）
   timeparse.py     严格 RFC 3339 UTC 整秒解析
-  models.py        SQLAlchemy ORM（demurrage_records）
+  models.py        SQLAlchemy ORM（demurrage_records / voyage_cap_lists / voyage_cap_items）
   db.py config.py  引擎 / 会话 / 配置
-alembic/           数据库迁移（0001_initial，0002 回填零允许时长）
+alembic/           数据库迁移（0001_initial，0002 回填零允许时长，0003 航次封顶清单）
 scripts/
   entrypoint.sh    等待数据库 → alembic upgrade → uvicorn
   verify.py        一次性黑盒验收脚本（仅标准库）
@@ -89,6 +91,9 @@ docker compose --profile verify run --rm verify
   省略该字段的旧格式请求按零处理，费用与历史一致。
 - **结果对比**：费率/允许时长变化准确反映费用差额；暂停仅顺序不同不产生差异，
   实际区间变化如实可见；缺失标识的 404 指明基准或候选；相同标识对比为空差异。
+- **航次封顶清单**：合计未超上限逐项照录；超限时按比例分配、最大余数法补足
+  整分且总额精确等于上限；同余数按提交顺序分配；零费用项分得零；重复标识的
+  422 定位到下标，缺失引用的 404 指出下标与标识；清单可按标识完整回放。
 
 退出码为 0 即验收通过。
 
@@ -185,6 +190,61 @@ docker compose --profile verify run --rm verify
 - 两个标识相同时返回空差异（`changes` 全 `false`）与全零增减；
 - 任一标识不存在时返回 `404`，`detail` 指明缺失的是 `base_id` 还是
   `candidate_id`；失败请求不写库。
+
+### 生成航次封顶清单 `POST /api/v1/demurrage/voyage-caps`
+
+同一航次在多个港口分别形成的结算结果，可由结算员汇总为一份**不可变**的
+航次封顶清单：按提交顺序引用 **2 至 20 个**既有结果标识，并给定非负整数分的
+赔付上限 `cap_cents`。
+
+请求：
+
+```json
+{
+  "result_ids": ["…结果标识1…", "…结果标识2…", "…结果标识3…"],
+  "cap_cents": 100
+}
+```
+
+分配规则：
+
+1. 各项原费用（`total_cents`）合计**未超过**上限时逐项照录；
+2. **超过**时按各项原费用比例分配上限：先取 `cap × 原费用 / 合计` 的整数部分，
+   剩余整分按**最大余数法**逐项补足，**余数相同按提交顺序**（下标小者优先），
+   **零费用项始终分得零**；分配总额精确等于上限。
+
+`201` 响应（清单与明细为创建时刻快照，`created_at` 为创建时间）：
+
+```json
+{
+  "id": "…清单标识…",
+  "cap_cents": 100,
+  "original_total_cents": 300,
+  "allocated_total_cents": 100,
+  "capped": true,
+  "items": [
+    {"position": 0, "result_id": "…", "original_cents": 100, "allocated_cents": 34},
+    {"position": 1, "result_id": "…", "original_cents": 100, "allocated_cents": 33},
+    {"position": 2, "result_id": "…", "original_cents": 100, "allocated_cents": 33}
+  ],
+  "created_at": "2026-09-11T…Z"
+}
+```
+
+错误：
+
+- `result_ids` 中标识重复：`422`，错误定位到重复出现的下标
+  （`body/result_ids/<下标>`）；
+- 引用的结果不存在：`404`，`detail` 指出缺失下标与标识
+  （如 `result_ids[1]`）；
+- `cap_cents` 非法（负数、小数、字符串、布尔等）：`422` 定位到
+  `body/cap_cents`；结果数量不足 2 个或超过 20 个：`422` 定位到
+  `body/result_ids`；
+- 以上失败均**不会写入任何清单或明细**。
+
+### 按清单标识回放 `GET /api/v1/demurrage/voyage-caps/{id}`
+
+成功返回 `200`（结构与创建响应完全一致，明细按提交顺序）；不存在返回 `404`。
 
 ### 错误格式（422，字段可定位）
 

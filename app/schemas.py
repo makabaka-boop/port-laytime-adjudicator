@@ -123,3 +123,36 @@ class DemurrageComparison(BaseModel):
     candidate_id: str
     changes: ComparisonChanges
     deltas: ComparisonDeltas
+
+
+class VoyageCapCreate(StrictModel):
+    """航次封顶清单创建请求：按提交顺序引用 2 至 20 个既有结算结果。"""
+
+    result_ids: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="既有结算结果标识，按提交顺序，2 至 20 个，不得重复",
+    )
+    cap_cents: NonNegativeInt = Field(
+        ..., description="赔付上限，非负严格整数，单位分"
+    )
+
+
+class VoyageCapItemOut(BaseModel):
+    """清单明细：提交顺序下标、结果标识、原费用与分配费用快照。"""
+
+    position: int
+    result_id: str
+    original_cents: int
+    allocated_cents: int
+
+
+class VoyageCapListResult(BaseModel):
+    id: str
+    cap_cents: int
+    original_total_cents: int
+    allocated_total_cents: int
+    capped: bool
+    items: list[VoyageCapItemOut]
+    created_at: str

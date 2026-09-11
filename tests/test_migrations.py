@@ -28,14 +28,31 @@ def test_alembic_upgrade_and_downgrade(tmp_path):
     _alembic("upgrade", "head", url=url)
     engine = sa.create_engine(url)
     inspector = sa.inspect(engine)
-    assert "demurrage_records" in inspector.get_table_names()
+    table_names = inspector.get_table_names()
+    assert "demurrage_records" in table_names
+    # 0003：航次封顶清单与明细
+    assert "voyage_cap_lists" in table_names
+    assert "voyage_cap_items" in table_names
     columns = {c["name"] for c in inspector.get_columns("demurrage_records")}
     assert EXPECTED_COLUMNS <= columns
+    list_columns = {c["name"] for c in inspector.get_columns("voyage_cap_lists")}
+    assert {
+        "id", "cap_cents", "original_total_cents",
+        "allocated_total_cents", "item_count", "created_at",
+    } <= list_columns
+    item_columns = {c["name"] for c in inspector.get_columns("voyage_cap_items")}
+    assert {
+        "id", "list_id", "position", "result_id",
+        "original_cents", "allocated_cents",
+    } <= item_columns
     engine.dispose()
 
     _alembic("downgrade", "base", url=url)
     engine = sa.create_engine(url)
-    assert "demurrage_records" not in sa.inspect(engine).get_table_names()
+    remaining = sa.inspect(engine).get_table_names()
+    assert "demurrage_records" not in remaining
+    assert "voyage_cap_lists" not in remaining
+    assert "voyage_cap_items" not in remaining
     engine.dispose()
 
 
