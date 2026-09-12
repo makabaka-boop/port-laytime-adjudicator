@@ -245,6 +245,58 @@ def _insert_inconsistent(record_id: str, pauses_merged: str, paused: int,
         )
 
 
+def _insert_record(record_id: str, **fields) -> None:
+    """以原始 SQL 写入一条可逐字段篡改的持久化记录（默认值自洽）。"""
+    defaults = {
+        "work_start": "2026-09-10 00:00:00+00:00",
+        "work_end": "2026-09-10 08:00:00+00:00",
+        "pauses": "[]",
+        "pauses_merged": "[]",
+        "rate": 100,
+        "work_seconds": 8 * 3600,
+        "paused": 0,
+        "allowed": 0,
+        "allowed_used": 0,
+        "billable": 8 * 3600,
+        "billable_hours": 8,
+        "total_cents": 800,
+        "created_at": "2026-09-10 00:00:00+00:00",
+    }
+    defaults.update(fields)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO demurrage_records (
+                    id, work_start, work_end, pauses, rate_cents_per_hour,
+                    pauses_merged, work_seconds, paused_seconds,
+                    allowed_seconds, allowed_seconds_used,
+                    billable_seconds, billable_hours, total_cents, created_at
+                ) VALUES (
+                    :id, :work_start, :work_end, :pauses, :rate,
+                    :pauses_merged, :work_seconds, :paused,
+                    :allowed, :allowed_used, :billable,
+                    :billable_hours, :total_cents, :created_at
+                )
+                """
+            ),
+            {"id": record_id, **defaults},
+        )
+
+
+def _assert_timeline_rejected(client, record_id: str, fragment: str) -> None:
+    """回放必须以 409 快照不一致拒绝，且记录保持原样、不被写入修改。"""
+    before = row_count()
+    resp = timeline(client, record_id)
+    assert resp.status_code == 409, (record_id, resp.text)
+    detail = resp.json()["detail"]
+    assert record_id in detail
+    assert fragment in detail
+    assert row_count() == before
+    # GET 回查仍可读，服务不改动原记录
+    assert client.get(f"{PATH}/{record_id}").status_code == 200
+
+
 INCONSISTENT_SNAPSHOTS = [
     # 合并暂停互相重叠：不是已合并快照，边界扫描拒绝
     (
@@ -299,3 +351,72 @@ def test_inconsistent_snapshot_returns_409_and_record_untouched(client):
         fetched = client.get(f"{PATH}/{record_id}")
         assert fetched.status_code == 200
         assert fetched.json()["paused_seconds"] == paused
+
+
+def test_work_seconds_mismatching_boundary_span_reports_snapshot_inconsistency(client):
+    """作业总秒数与起止边界时长不符：报告快照不一致而非返回时间线。"""
+    record_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    # 边界恰为 8 小时（28800 秒），记录的作业总秒数却被篡改为 28700 秒；
+    # 其余字段按 28800 秒自洽，接口此前会忽略该差异照常返回时间线。
+    _insert_record(
+        record_id,
+        work_seconds=28700,
+        billable=28800,
+        billable_hours=8,
+        total_cents=800,
+    )
+    _assert_timeline_rejected(client, record_id, "快照不一致")
+
+
+def test_used_allowance_exceeding_contracted_allowed_seconds_is_rejected(client):
+    """实际抵扣超过约定允许时长：拒绝异常快照，不展示超额抵扣。"""
+    record_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    # 约定允许仅 100 秒，实际抵扣却记为 3600 秒。分段按 3600 秒抵扣扫描
+    # 可以成功（非暂停时长充足）、各类分段合计也与记录一致，只有
+    # “实际抵扣不得超过约定允许时长”这一快照不变量能将其拒绝。
+    _insert_record(
+        record_id,
+        allowed=100,
+        allowed_used=3600,
+        billable=25200,
+        billable_hours=7,
+        total_cents=700,
+    )
+    _assert_timeline_rejected(client, record_id, "异常抵扣")
+
+
+def test_stored_billable_hours_not_matching_billable_seconds_is_rejected(client):
+    """计费秒数应折算 7 小时但已存 99 小时：报告汇总不一致。"""
+    record_id = "77777777-7777-7777-7777-777777777777"
+    # 净作业 = 28800 - 3600 = 25200 秒，向上取整应为 7 小时；
+    # 已存计费小时被篡改为 99（总额保持与秒数一致，专门暴露小时校验缺口）。
+    _insert_record(
+        record_id,
+        pauses_merged=(
+            '[{"start": "2026-09-10T01:00:00Z",'
+            ' "end": "2026-09-10T02:00:00Z"}]'
+        ),
+        paused=3600,
+        billable=25200,
+        billable_hours=99,
+        total_cents=700,
+    )
+    _assert_timeline_rejected(client, record_id, "汇总不一致")
+
+
+def test_stored_total_cents_not_matching_hours_times_rate_is_rejected(client):
+    """7 个计费小时按 100 分/小时应为 700 分却记为 999 分：报告费用不一致。"""
+    record_id = "88888888-8888-8888-8888-888888888888"
+    # 秒数与小时均自洽（25200 秒 → 7 小时），仅总费用被篡改为 999 分。
+    _insert_record(
+        record_id,
+        pauses_merged=(
+            '[{"start": "2026-09-10T01:00:00Z",'
+            ' "end": "2026-09-10T02:00:00Z"}]'
+        ),
+        paused=3600,
+        billable=25200,
+        billable_hours=7,
+        total_cents=999,
+    )
+    _assert_timeline_rejected(client, record_id, "费用不一致")
