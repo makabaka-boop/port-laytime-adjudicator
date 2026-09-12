@@ -3,25 +3,32 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.eventbook import EventCompileError
+from app.intervals import IntervalError
 from app.schemas import (
     DemurrageCompareRequest,
     DemurrageComparison,
     DemurrageCreate,
     DemurrageResult,
     DemurrageTimeline,
+    EventLogCreate,
+    EventLogResult,
     VoyageCapCreate,
     VoyageCapListResult,
 )
 from app.services import (
     ComparisonTargetMissing,
     DuplicateResultId,
+    EventLogResultMissing,
     TimelineInconsistency,
     VoyageCapTargetMissing,
     compare_calculations,
     create_calculation,
+    create_event_log,
     create_voyage_cap_list,
     get_calculation,
     get_calculation_timeline,
+    get_event_log,
     get_voyage_cap_list,
 )
 
@@ -125,5 +132,63 @@ def read_voyage_cap(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"找不到航次封顶清单：{list_id}",
+        )
+    return result
+
+
+def _raise_event_compile_422(exc: EventCompileError) -> None:
+    """事件簿编译失败：与 schema 校验一致的 422 结构，loc 定位到事件下标。"""
+    raise RequestValidationError(
+        [
+            {
+                "loc": ("body", "events", exc.index),
+                "msg": str(exc),
+                "type": "value_error",
+            }
+        ]
+    ) from exc
+
+
+@router.post(
+    "/event-logs",
+    response_model=EventLogResult,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_event_log_entry(
+    payload: EventLogCreate, db: Session = Depends(get_db)
+) -> dict:
+    try:
+        return create_event_log(db, payload)
+    except EventCompileError as exc:
+        # 首尾/配对/严格递增非法转换：422 定位到事件下标，且已整体回滚。
+        _raise_event_compile_422(exc)
+    except IntervalError as exc:
+        # 计费失败同样不得留下事件簿或结算记录（事务已回滚）。
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "events"),
+                    "msg": f"事件簿计费失败：{exc}",
+                    "type": "value_error",
+                }
+            ]
+        ) from exc
+
+
+@router.get("/event-logs/{event_log_id}", response_model=EventLogResult)
+def read_event_log(
+    event_log_id: str, db: Session = Depends(get_db)
+) -> dict:
+    try:
+        result = get_event_log(db, event_log_id)
+    except EventLogResultMissing as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"找不到事件簿：{event_log_id}",
         )
     return result

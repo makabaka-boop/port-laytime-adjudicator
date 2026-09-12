@@ -7,6 +7,12 @@
 复核单笔费用时，还可按结果标识读取**计费时间线**：由持久化的作业边界与合并暂停
 扫描出首尾相接、覆盖整个作业区间的连续分段，逐段标明暂停、允许抵扣或计费。
 
+港方交接班只留下**按时发生的作业事件**时，结算员可直接提交一份**事件簿**
+（开工、暂停、复工、完工依次发生）与费率、允许秒数：领域编译器以**确定性
+状态机**校验首尾、配对与严格递增时间，再把每对有效「暂停→复工」转换为现有
+左闭右开区间并调用同一套计费规则；事件簿与结算结果在同一事务落库，可按
+事件簿标识完整回放，无需人工先整理暂停区间。
+
 技术栈：**Python 3.12 · FastAPI · SQLAlchemy 2 · Alembic · PostgreSQL 16**，
 容器化使用 Docker Compose，测试使用 pytest。
 
@@ -37,18 +43,21 @@
 ```
 app/
   main.py          FastAPI 应用与 /health
-  routers.py       POST/GET 结算接口、计费时间线、结果对比与航次封顶清单接口
+  routers.py       POST/GET 结算接口、计费时间线、结果对比、航次封顶清单、事件簿接口
   schemas.py       Pydantic v2 请求/响应模型（字段级、可定位错误）
   services.py      计算编排、持久化、序列化、时间线生成、封顶分配（最大余数法）
+  eventbook.py     交接班事件簿的领域编译器：确定性状态机 + 暂停区间派生（纯函数）
   intervals.py     裁剪 / 合并 / 取整 / 计费 / 时间线分段纯函数（规则核心）
   timeparse.py     严格 RFC 3339 UTC 整秒解析
-  models.py        SQLAlchemy ORM（demurrage_records / voyage_cap_lists / voyage_cap_items）
+  models.py        SQLAlchemy ORM（demurrage_records / voyage_cap_lists /
+                   voyage_cap_items / event_logs）
   db.py config.py  引擎 / 会话 / 配置
-alembic/           数据库迁移（0001_initial，0002 回填零允许时长，0003 航次封顶清单）
+alembic/           数据库迁移（0001_initial，0002 回填零允许时长，0003 航次封顶
+                   清单，0004 交接班事件簿）
 scripts/
   entrypoint.sh    等待数据库 → alembic upgrade → uvicorn
   verify.py        一次性黑盒验收脚本（仅标准库）
-tests/             pytest（时间解析 / 区间规则与时间线 / API / 迁移）
+tests/             pytest（时间解析 / 区间规则与时间线 / API / 事件簿 / 迁移）
 docker-compose.yml Dockerfile requirements.txt
 ```
 
@@ -99,6 +108,12 @@ docker compose --profile verify run --rm verify
 - **计费时间线**：相接暂停按已合并快照只形成连续分段，分段首尾相接且覆盖
   整个作业区间；允许时长跨多个工作段消耗并在段内精确切分，耗尽后的工作段
   计费；汇总回显与原结果一致；缺失标识得到带标识的 404。
+- **交接班事件簿**：无暂停日志（开工→完工）派生空区间、整段计费；多次暂停
+  日志按「暂停→复工」配对派生左闭右开区间并调用同一套计费规则，费用与直接
+  提交区间完全一致；创建响应返回完整事件簿（原始事件、派生区间、编译摘要、
+  关联结果标识与结果），第二入口按标识回放内容稳定；缺开工/缺完工、连续暂停、
+  未暂停即复工、暂停后直接完工、时间倒退均 `422` 且定位到事件下标；编译或
+  计费失败不留下事件簿或结算记录（同一事务原子回滚）。
 
 退出码为 0 即验收通过。
 
@@ -292,6 +307,98 @@ docker compose --profile verify run --rm verify
 
 成功返回 `200`（结构与创建响应完全一致，明细按提交顺序）；不存在返回 `404`。
 
+### 提交交接班事件簿 `POST /api/v1/demurrage/event-logs`
+
+港方交接班只留下按时发生的作业事件时，结算员无需手工整理暂停区间：依次提交
+**开工、暂停、复工、完工**事件，连同费率与允许秒数，由领域编译器以确定性
+状态机校验后生成结算。
+
+- 事件类型：`start_work`（开工）、`pause`（暂停）、`resume`（复工）、
+  `finish_work`（完工）；
+- 状态机迁移固定为 `未开工 →开工→ 作业中 →暂停→ 暂停中 →复工→ 作业中
+  →完工→ 已完工`；
+- **缺少开工或完工**（首项非开工 / 末项非完工）、**连续暂停**、
+  **未暂停即复工**、**暂停后直接完工**，均为 `422` 并定位到事件下标
+  （`body/events/<下标>`）；
+- 相邻事件时间必须**严格递增**，时间倒退或相等同样 `422` 定位到事件下标；
+  字段级问题（小数秒等）定位到 `body/events/<下标>/at`；
+- 编译通过后，每对有效「暂停 → 复工」转换为左闭右开区间
+  `[pause.at, resume.at)` 并调用原计费规则（裁剪/合并/允许秒数/向上取整
+  完全一致）；
+- **同一事务**保存原始事件、派生区间、编译摘要、关联结果标识与结算结果；
+  编译或计费失败整体回滚，不留下事件簿或结算记录。
+
+请求：
+
+```json
+{
+  "events": [
+    {"type": "start_work", "at": "2026-09-10T00:00:00Z"},
+    {"type": "pause",      "at": "2026-09-10T01:00:00Z"},
+    {"type": "resume",     "at": "2026-09-10T02:00:00Z"},
+    {"type": "pause",      "at": "2026-09-10T04:00:00Z"},
+    {"type": "resume",     "at": "2026-09-10T05:00:00Z"},
+    {"type": "finish_work","at": "2026-09-10T08:00:00Z"}
+  ],
+  "rate_cents_per_hour": 100,
+  "allowed_seconds": 3600
+}
+```
+
+`201` 响应（返回**完整事件簿**：原始事件、派生暂停、费率、允许秒数、
+编译摘要、关联结果标识，以及与原创建接口结构完全相同的结算结果）：
+
+```json
+{
+  "id": "…事件簿标识…",
+  "events": [
+    {"index": 0, "type": "start_work", "at": "2026-09-10T00:00:00Z"},
+    {"index": 1, "type": "pause",      "at": "2026-09-10T01:00:00Z"},
+    "…按下标顺序回显的全部原始事件…"
+  ],
+  "pauses_derived": [
+    {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z"},
+    {"start": "2026-09-10T04:00:00Z", "end": "2026-09-10T05:00:00Z"}
+  ],
+  "rate_cents_per_hour": 100,
+  "allowed_seconds": 3600,
+  "compilation_summary": {
+    "event_count": 6,
+    "valid_pause_count": 2,
+    "transitions": ["start_work", "pause", "resume", "pause", "resume", "finish_work"],
+    "work_start_event": "start_work",
+    "work_end_event": "finish_work"
+  },
+  "result_id": "…关联结算结果标识…",
+  "result": {
+    "id": "…与 result_id 相同…",
+    "work_start": "2026-09-10T00:00:00Z",
+    "work_end": "2026-09-10T08:00:00Z",
+    "pauses": ["…即 pauses_derived…"],
+    "pauses_merged": ["…原计费规则的合并快照…"],
+    "rate_cents_per_hour": 100,
+    "work_seconds": 28800,
+    "paused_seconds": 7200,
+    "allowed_seconds": 3600,
+    "allowed_seconds_used": 3600,
+    "billable_seconds": 18000,
+    "billable_hours": 5,
+    "total_cents": 500,
+    "created_at": "2026-09-12T…Z"
+  },
+  "created_at": "2026-09-12T…Z"
+}
+```
+
+无暂停日志（开工后直接完工）时 `pauses_derived` 与摘要中的
+`valid_pause_count` 均为空/零，整段作业按原规则计费。关联结果也可直接经
+`GET /api/v1/demurrage/calculations/{result_id}`（及其时间线/对比等接口）回查。
+
+### 按事件簿标识回放 `GET /api/v1/demurrage/event-logs/{id}`
+
+成功返回 `200`（结构与创建响应完全一致：输入事件簿与生成结果一并回放，
+内容稳定）；事件簿不存在返回 `404`，`detail` 回显标识。
+
 ### 错误格式（422，字段可定位）
 
 FastAPI/Pydantic 标准结构，每条错误含 `loc`（字段路径）、`msg`、`type`，例如：
@@ -310,6 +417,9 @@ FastAPI/Pydantic 标准结构，每条错误含 `loc`（字段路径）、`msg`�
 `body/pauses/<下标>/start|end`；费率与允许秒数问题分别定位到
 `body/rate_cents_per_hour`、`body/allowed_seconds`
 （均为严格非负整数，`1.5`、`3600.0`、字符串、布尔、负数均拒绝）。
+事件簿的首尾/配对/时间递增问题定位到 `body/events/<下标>`，事件时刻格式
+问题定位到 `body/events/<下标>/at`，空事件簿定位到 `body/events`，
+费率与允许秒数同样定位到对应字段。
 多余字段（`extra="forbid"`）、缺字段同样 422。非法请求不落任何记录。
 
 ## 本地开发与测试（无需 Docker / PostgreSQL）

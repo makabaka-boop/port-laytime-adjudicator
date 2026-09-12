@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.eventbook import compile_event_book
 from app.intervals import (
     Calculation,
     IntervalError,
@@ -12,8 +13,8 @@ from app.intervals import (
     build_timeline,
     calculate as run_calculate,
 )
-from app.models import DemurrageRecord, VoyageCapItem, VoyageCapList
-from app.schemas import DemurrageCreate, VoyageCapCreate
+from app.models import DemurrageRecord, EventLog, VoyageCapItem, VoyageCapList
+from app.schemas import DemurrageCreate, EventLogCreate, VoyageCapCreate
 from app.timeparse import format_utc_second, parse_utc_second
 
 
@@ -403,3 +404,123 @@ def create_voyage_cap_list(db: Session, payload: VoyageCapCreate) -> dict:
 def get_voyage_cap_list(db: Session, list_id: str) -> dict | None:
     cap_list = db.get(VoyageCapList, list_id)
     return _voyage_cap_to_out(cap_list) if cap_list is not None else None
+
+
+class EventLogResultMissing(RuntimeError):
+    """事件簿关联的结算结果缺失（数据一致性错误，409 语义）。"""
+
+    def __init__(self, event_log_id: str, result_id: str) -> None:
+        self.event_log_id = event_log_id
+        self.result_id = result_id
+        super().__init__(
+            f"事件簿 {event_log_id} 关联的结算结果缺失：{result_id}"
+        )
+
+
+def _serialize_event_log(db: Session, event_log: EventLog) -> dict:
+    record = db.get(DemurrageRecord, event_log.result_id)
+    if record is None:
+        # 事件簿与结果在同一事务落库，缺结果只能是快照被破坏（409 语义）。
+        raise EventLogResultMissing(event_log.id, event_log.result_id)
+    return {
+        "id": event_log.id,
+        "events": event_log.events,
+        "pauses_derived": event_log.pauses_derived,
+        "rate_cents_per_hour": event_log.rate_cents_per_hour,
+        "allowed_seconds": event_log.allowed_seconds,
+        "compilation_summary": event_log.compilation_summary,
+        "result_id": event_log.result_id,
+        "result": _to_out(record),
+        "created_at": format_utc_second(event_log.created_at),
+    }
+
+
+class EventLogResultMissing(RuntimeError):
+    """事件簿关联的结算结果缺失（数据一致性错误，409 语义）。"""
+
+    def __init__(self, event_log_id: str, result_id: str) -> None:
+        self.event_log_id = event_log_id
+        self.result_id = result_id
+        super().__init__(
+            f"事件簿 {event_log_id} 关联的结算结果缺失：{result_id}"
+        )
+
+
+def create_event_log(db: Session, payload: EventLogCreate) -> dict:
+    """编译事件簿、调用原计费规则，并在同一事务保存全部产物。
+
+    原始事件、派生区间、编译摘要与关联结果标识，连同结算结果本身，
+    在**同一事务**内写入；编译（``EventCompileError``）或计费
+    （``IntervalError``）失败时整体回滚，不留下事件簿或结算记录。
+    """
+    # 1. 领域编译：确定性状态机校验首尾、配对与严格递增，产出派生暂停。
+    raw_events = [(event.type, parse_utc_second(event.at)) for event in payload.events]
+    compiled = compile_event_book(raw_events)
+
+    # 2. 有效暂停直接作为现有左闭右开区间，调用原计费规则。
+    result = run_calculate(
+        work_start=compiled.work_start,
+        work_end=compiled.work_end,
+        raw_pauses=compiled.pauses,
+        rate_cents_per_hour=payload.rate_cents_per_hour,
+        allowed_seconds=payload.allowed_seconds,
+    )
+
+    record_id = str(uuid.uuid4())
+    log_id = str(uuid.uuid4())
+    record = DemurrageRecord(
+        id=record_id,
+        work_start=result.work_start,
+        work_end=result.work_end,
+        # 结算记录的“原始输入”即事件簿派生的有效暂停区间。
+        pauses=[
+            {"start": format_utc_second(s), "end": format_utc_second(e)}
+            for s, e in compiled.pauses
+        ],
+        rate_cents_per_hour=result.rate_cents_per_hour,
+        allowed_seconds=result.allowed_seconds,
+        pauses_merged=[
+            {"start": format_utc_second(s), "end": format_utc_second(e)}
+            for s, e in result.pauses_merged
+        ],
+        work_seconds=result.work_seconds,
+        paused_seconds=result.paused_seconds,
+        allowed_seconds_used=result.allowed_seconds_used,
+        billable_seconds=result.billable_seconds,
+        billable_hours=result.billable_hours,
+        total_cents=result.total_cents,
+    )
+    event_log = EventLog(
+        id=log_id,
+        events=[
+            {"index": index, "type": event.type, "at": event.at}
+            for index, event in enumerate(payload.events)
+        ],
+        compilation_summary=compiled.summary(),
+        rate_cents_per_hour=payload.rate_cents_per_hour,
+        allowed_seconds=payload.allowed_seconds,
+        pauses_derived=[
+            {"start": format_utc_second(s), "end": format_utc_second(e)}
+            for s, e in compiled.pauses
+        ],
+        result_id=record_id,
+    )
+
+    # 3. 同一事务写入；任一失败回滚，事件簿与结算记录都不会留下。
+    try:
+        db.add(record)
+        db.add(event_log)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(event_log)
+    return _serialize_event_log(db, event_log)
+
+
+def get_event_log(db: Session, event_log_id: str) -> dict | None:
+    """按事件簿标识回放：原始输入（事件簿 + 费率 + 允许秒数）与生成结果。"""
+    event_log = db.get(EventLog, event_log_id)
+    if event_log is None:
+        return None
+    return _serialize_event_log(db, event_log)

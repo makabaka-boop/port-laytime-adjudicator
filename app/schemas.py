@@ -177,3 +177,65 @@ class VoyageCapListResult(BaseModel):
     capped: bool
     items: list[VoyageCapItemOut]
     created_at: str
+
+
+# 交接班事件类型：开工 / 暂停 / 复工 / 完工。
+EventType = Literal["start_work", "pause", "resume", "finish_work"]
+
+
+class EventIn(StrictModel):
+    """事件簿中的单个作业事件：类型 + RFC 3339 UTC 整秒时刻。"""
+
+    type: EventType
+    at: str = Field(..., description="事件发生时刻，RFC 3339 UTC 整秒")
+
+    @field_validator("at")
+    @classmethod
+    def _parse_at(cls, value: str) -> str:
+        parse_utc_second(value)  # 仅校验，保留原始字符串
+        return value
+
+
+class EventLogCreate(StrictModel):
+    """事件簿创建请求：完整事件序列 + 费率 + 允许秒数。
+
+    字段级（时间格式、严格整数）之外的首尾、配对与严格递增校验由领域
+    编译器（确定性状态机）完成，错误同样定位到事件下标。
+    """
+
+    events: list[EventIn] = Field(
+        ..., min_length=1, description="依次发生的作业事件：开工、暂停、复工、完工"
+    )
+    rate_cents_per_hour: NonNegativeInt = Field(
+        ..., description="费率，非负整数，分/小时"
+    )
+    allowed_seconds: NonNegativeInt = Field(
+        default=0,
+        description="租约约定的免计滞期允许作业秒数，非负严格整数；省略按 0。",
+    )
+
+
+class EventOut(BaseModel):
+    """回放入口与创建响应中的原始事件（含提交下标）。"""
+
+    index: int
+    type: EventType
+    at: str
+
+
+class EventLogResult(BaseModel):
+    """事件簿创建/回放响应：完整事件簿、编译摘要与关联结算结果。"""
+
+    id: str
+    events: list[EventOut]
+    # 派生暂停区间（左闭右开）：有效「暂停→复工」对的编译产物
+    pauses_derived: list[IntervalOut]
+    rate_cents_per_hour: int
+    allowed_seconds: int
+    # 编译摘要：事件数、有效暂停数、完整状态迁移序列
+    compilation_summary: dict
+    # 关联结算结果标识
+    result_id: str
+    # 关联结算结果（与 POST /calculations 完全相同的结构，可回查）
+    result: DemurrageResult
+    created_at: str

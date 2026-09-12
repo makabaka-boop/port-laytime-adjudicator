@@ -18,6 +18,12 @@
      汇总回显与原结果一致；缺失标识得到带标识的 404。
      （快照不一致的 409 数据一致性错误需直接改动持久化数据才能触发，
      由 pytest 套件 tests/test_timeline.py 覆盖。）
+  9. 交接班事件簿：无暂停日志派生空区间、多次暂停日志按「暂停→复工」配对派生
+     左闭右开区间并按原计费规则费用可复核（含相接区间仍走原合并规则）；
+     创建响应返回完整事件簿，第二个入口按标识回放输入与结果完全一致，
+     关联结果标识可在原创建接口回查；缺开工/缺完工、连续暂停、未暂停即复工、
+     暂停后直接完工、时间倒退均 422 且定位到事件下标，非法响应无任何标识。
+     （编译/计费失败的原子回滚由 pytest 套件 tests/test_event_logs.py 验证。）
 
 用法： python -m scripts.verify [BASE_URL]
 退出码 0 表示全部通过，否则为 1。
@@ -32,6 +38,7 @@ BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://api:8000"
 PATH = "/api/v1/demurrage/calculations"
 COMPARE_PATH = "/api/v1/demurrage/comparisons"
 CAPS_PATH = "/api/v1/demurrage/voyage-caps"
+EVENT_LOGS_PATH = "/api/v1/demurrage/event-logs"
 
 
 def request(method: str, url: str, body: dict | None = None):
@@ -704,6 +711,205 @@ def case_billing_timeline() -> None:
     print(f"  OK  缺失标识的 404 回显标识 -> {err['detail']}")
 
 
+def case_event_logs() -> None:
+    print("案例 9：交接班事件簿——确定性状态机编译、派生暂停、原子性与回放")
+
+    def ev(kind: str, at: str) -> dict:
+        return {"type": kind, "at": at}
+
+    # 9.1 日志一（无暂停）：开工→完工，派生区间为空，整段 8 小时计费
+    body = {
+        "events": [
+            ev("start_work", "2026-09-10T00:00:00Z"),
+            ev("finish_work", "2026-09-10T08:00:00Z"),
+        ],
+        "rate_cents_per_hour": 100,
+    }
+    status, result = request("POST", BASE_URL + EVENT_LOGS_PATH, body)
+    assert_equal(status, 201, "[无暂停] HTTP 状态码")
+    # 创建响应返回完整事件簿（含提交下标）
+    assert_equal(
+        result["events"],
+        [
+            {"index": 0, "type": "start_work", "at": "2026-09-10T00:00:00Z"},
+            {"index": 1, "type": "finish_work", "at": "2026-09-10T08:00:00Z"},
+        ],
+        "[无暂停] 完整事件簿",
+    )
+    assert_equal(result["pauses_derived"], [], "[无暂停] 派生暂停为空")
+    assert_equal(
+        result["compilation_summary"],
+        {
+            "event_count": 2,
+            "valid_pause_count": 0,
+            "transitions": ["start_work", "finish_work"],
+            "work_start_event": "start_work",
+            "work_end_event": "finish_work",
+        },
+        "[无暂停] 编译摘要",
+    )
+    assert_equal(result["result"]["paused_seconds"], 0, "[无暂停] 暂停秒数 0")
+    assert_equal(result["result"]["billable_hours"], 8, "[无暂停] 计费 8 小时")
+    assert_equal(result["result"]["total_cents"], 800, "[无暂停] 费用 800")
+    assert_equal(result["result"]["id"], result["result_id"], "[无暂停] 关联结果标识")
+    # 关联结果可在原创建接口按 id 回查
+    status, linked = request("GET", f"{BASE_URL}{PATH}/{result['result_id']}")
+    assert_equal(status, 200, "[无暂停] 关联结果回查状态码")
+    assert_equal(linked["total_cents"], 800, "[无暂停] 关联结果费用一致")
+    # 回放内容稳定
+    status, replay = request("GET", f"{BASE_URL}{EVENT_LOGS_PATH}/{result['id']}")
+    assert_equal(status, 200, "[无暂停] 回放状态码")
+    assert_equal(replay, result, "[无暂停] 回放内容与创建响应完全一致")
+
+    # 9.2 日志二（多次暂停）：两对「暂停→复工」派生两个左闭右开区间。
+    # 严格递增状态机保证派生暂停之间必有正长度工作间隙（不可能相接/重叠），
+    # 因此原合并规则下它们原样保留；允许 1 小时在净作业时长上扣减。
+    body = {
+        "events": [
+            ev("start_work", "2026-09-10T00:00:00Z"),
+            ev("pause", "2026-09-10T01:00:00Z"),
+            ev("resume", "2026-09-10T02:00:00Z"),
+            ev("pause", "2026-09-10T04:00:00Z"),
+            ev("resume", "2026-09-10T05:00:00Z"),
+            ev("finish_work", "2026-09-10T08:00:00Z"),
+        ],
+        "rate_cents_per_hour": 100,
+        "allowed_seconds": 3600,
+    }
+    status, result = request("POST", BASE_URL + EVENT_LOGS_PATH, body)
+    assert_equal(status, 201, "[多次暂停] HTTP 状态码")
+    assert_equal(
+        result["pauses_derived"],
+        [
+            {"start": "2026-09-10T01:00:00Z", "end": "2026-09-10T02:00:00Z"},
+            {"start": "2026-09-10T04:00:00Z", "end": "2026-09-10T05:00:00Z"},
+        ],
+        "[多次暂停] 派生两对左闭右开区间",
+    )
+    assert_equal(
+        result["compilation_summary"]["valid_pause_count"], 2,
+        "[多次暂停] 编译摘要记录 2 对有效暂停",
+    )
+    # 派生暂停互不相接，原合并规则下保持不变（同一套计费规则的直接证据）
+    assert_equal(
+        result["result"]["pauses_merged"], result["pauses_derived"],
+        "[多次暂停] 合并快照与派生区间一致（调用原计费规则）",
+    )
+    # 作业 8h − 暂停 2h = 净作业 6h；再扣允许 1h -> 5h × 100 = 500
+    assert_equal(result["result"]["paused_seconds"], 2 * 3600, "[多次暂停] 暂停 2 小时")
+    assert_equal(result["result"]["allowed_seconds_used"], 3600, "[多次暂停] 允许扣减 1 小时")
+    assert_equal(result["result"]["billable_hours"], 5, "[多次暂停] 计费 5 小时")
+    assert_equal(result["result"]["total_cents"], 500, "[多次暂停] 费用 500")
+    # 回放输入与生成结果稳定
+    status, replay = request("GET", f"{BASE_URL}{EVENT_LOGS_PATH}/{result['id']}")
+    assert_equal(status, 200, "[多次暂停] 回放状态码")
+    assert_equal(replay, result, "[多次暂停] 回放内容与创建响应完全一致")
+
+    # 9.3 非法转换：全部 422 且定位到事件下标，响应中不出现任何标识
+    invalid_books = [
+        (
+            "缺少开工",
+            [
+                ev("pause", "2026-09-10T01:00:00Z"),
+                ev("resume", "2026-09-10T02:00:00Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "events/0",
+        ),
+        (
+            "缺少完工",
+            [
+                ev("start_work", "2026-09-10T00:00:00Z"),
+                ev("pause", "2026-09-10T01:00:00Z"),
+                ev("resume", "2026-09-10T02:00:00Z"),
+            ],
+            "events/2",
+        ),
+        (
+            "连续暂停",
+            [
+                ev("start_work", "2026-09-10T00:00:00Z"),
+                ev("pause", "2026-09-10T01:00:00Z"),
+                ev("pause", "2026-09-10T02:00:00Z"),
+                ev("resume", "2026-09-10T03:00:00Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "events/2",
+        ),
+        (
+            "未暂停即复工",
+            [
+                ev("start_work", "2026-09-10T00:00:00Z"),
+                ev("resume", "2026-09-10T01:00:00Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "events/1",
+        ),
+        (
+            "暂停后直接完工",
+            [
+                ev("start_work", "2026-09-10T00:00:00Z"),
+                ev("pause", "2026-09-10T01:00:00Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "events/2",
+        ),
+        (
+            "时间倒退",
+            [
+                ev("start_work", "2026-09-10T00:00:00Z"),
+                ev("pause", "2026-09-10T02:00:00Z"),
+                ev("resume", "2026-09-10T01:00:00Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "events/2",
+        ),
+        (
+            "时间未严格递增（相等）",
+            [
+                ev("start_work", "2026-09-10T00:00:00Z"),
+                ev("pause", "2026-09-10T01:00:00Z"),
+                ev("resume", "2026-09-10T01:00:00Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "events/2",
+        ),
+    ]
+    for label, bad_events, loc_fragment in invalid_books:
+        status, payload = request(
+            "POST",
+            BASE_URL + EVENT_LOGS_PATH,
+            {"events": bad_events, "rate_cents_per_hour": 100},
+        )
+        assert_equal(status, 422, f"[{label}] HTTP 状态码")
+        if "id" in payload or "result_id" in payload:
+            raise AssertionError(f"[{label}] 非法事件簿不应返回任何标识")
+        assert_loc_contains(payload["detail"], loc_fragment, label)
+
+    # 字段级错误同样定位到事件下标内的字段
+    status, payload = request(
+        "POST",
+        BASE_URL + EVENT_LOGS_PATH,
+        {
+            "events": [
+                ev("start_work", "2026-09-10T00:00:00.5Z"),
+                ev("finish_work", "2026-09-10T08:00:00Z"),
+            ],
+            "rate_cents_per_hour": 100,
+        },
+    )
+    assert_equal(status, 422, "[小数秒] HTTP 状态码")
+    assert_loc_contains(payload["detail"], "events/0/at", "小数秒事件时刻")
+
+    # 不存在的事件簿：404 且回显标识
+    missing = "00000000-0000-0000-0000-000000000000"
+    status, err = request("GET", f"{BASE_URL}{EVENT_LOGS_PATH}/{missing}")
+    assert_equal(status, 404, "不存在事件簿状态码")
+    if missing not in err["detail"]:
+        raise AssertionError(f"不存在事件簿的 404 未回显标识：{err['detail']}")
+    print(f"  OK  不存在事件簿的 404 回显标识 -> {err['detail']}")
+
+
 def main() -> int:
     print(f"验收目标: {BASE_URL}")
     try:
@@ -715,6 +921,7 @@ def main() -> int:
         case_compare_results()
         case_voyage_cap_lists()
         case_billing_timeline()
+        case_event_logs()
     except Exception as exc:
         print(f"\n验收失败: {exc}", file=sys.stderr)
         return 1

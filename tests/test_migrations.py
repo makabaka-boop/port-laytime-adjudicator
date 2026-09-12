@@ -33,6 +33,8 @@ def test_alembic_upgrade_and_downgrade(tmp_path):
     # 0003：航次封顶清单与明细
     assert "voyage_cap_lists" in table_names
     assert "voyage_cap_items" in table_names
+    # 0004：交接班事件簿
+    assert "event_logs" in table_names
     columns = {c["name"] for c in inspector.get_columns("demurrage_records")}
     assert EXPECTED_COLUMNS <= columns
     list_columns = {c["name"] for c in inspector.get_columns("voyage_cap_lists")}
@@ -45,6 +47,11 @@ def test_alembic_upgrade_and_downgrade(tmp_path):
         "id", "list_id", "position", "result_id",
         "original_cents", "allocated_cents",
     } <= item_columns
+    event_log_columns = {c["name"] for c in inspector.get_columns("event_logs")}
+    assert {
+        "id", "events", "compilation_summary", "rate_cents_per_hour",
+        "allowed_seconds", "pauses_derived", "result_id", "created_at",
+    } <= event_log_columns
     engine.dispose()
 
     _alembic("downgrade", "base", url=url)
@@ -53,6 +60,7 @@ def test_alembic_upgrade_and_downgrade(tmp_path):
     assert "demurrage_records" not in remaining
     assert "voyage_cap_lists" not in remaining
     assert "voyage_cap_items" not in remaining
+    assert "event_logs" not in remaining
     engine.dispose()
 
 
